@@ -1,0 +1,52 @@
+# ── Secrets / environment ─────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.json
+config.local.*
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Generated reports (contain ADO data) ──────────────────────────────────────
+reports/
+*.html
+*.pdf
+sprint_report.*
+sprint_status.html
+test_cases_US*.html
+review_test_cases_US*.html
+
+# ── Logs / temp ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+.cache/
