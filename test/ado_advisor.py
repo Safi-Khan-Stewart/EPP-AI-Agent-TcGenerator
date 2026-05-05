@@ -748,7 +748,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         if has_roles:
             add_tc({
                 'title': f"Unauthorized user is blocked from {feature_label}",
-                'objective': "Validate that unauthorized roles cannot perform the action (RULE FUNC 11)",
+                'objective': "Validate that unauthorized roles cannot perform the action",
                 'preconditions': "A user account without the required permissions exists",
                 'steps': [
                     "Log in to EPP as a user without the required role/permissions",
@@ -772,7 +772,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
             actor = roles_found[0]
             add_tc({
                 'title': f"System rejects invalid inputs for {feature_label}",
-                'objective': "Validate boundary / negative behavior (RULE FUNC 11)",
+                'objective': "Validate boundary and negative input behavior",
                 'preconditions': f"{actor} is logged in to EPP",
                 'steps': [
                     f"Log in to EPP as a {actor}",
@@ -849,7 +849,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         for label, cat, prio, expected, action_step in data_variants:
             add_tc({
                 'title': f"{feature_label} submission with {label}",
-                'objective': f"Validate data-input handling for {label} (RULE COV 08 / RULE DATA 09)",
+                'objective': f"Validate data-input handling for {label}",
                 'preconditions': (f"{actor} is logged in; the data entry form is accessible. "
                                   f"Test data source: CSV (header + valid + invalid + boundary rows + comment column)"),
                 'steps': [
@@ -880,7 +880,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         actor = roles_found[0]
         add_tc({
             'title': f"UI elements render correctly on {feature_label} screen",
-            'objective': "Validate visibility, enable/disable state, mandatory fields and default values (RULE FUNC 10)",
+            'objective': "Validate visibility, enable/disable state, mandatory fields and default values",
             'preconditions': f"{actor} is logged in; the {feature_label} screen is accessible",
             'steps': [
                 f"Log in to EPP as a {actor}",
@@ -1345,6 +1345,13 @@ def format_steps_as_ado_xml(steps, expected=''):
     return f'<steps id="0" last="{last_id}">{"".join(xml_steps)}</steps>'
 
 
+# Cache of ADO field reference names known to be missing in this project's
+# process template. Populated lazily after the first failed POST so that
+# subsequent test case creations skip these fields up front and avoid
+# triggering the noisy "Retry without optional fields" path on every call.
+_KNOWN_MISSING_FIELDS = set()
+
+
 def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, iteration_path,
                             priority=2, automation_status='Not Automated', extra_fields=None,
                             objective_html=None, preconditions_field_html=None,
@@ -1360,7 +1367,9 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
 
     `extra_fields` is a dict of additional ADO field reference names to set
     (e.g., custom fields like Custom.TestCategory, Custom.ApplicationName).
-    Unknown/custom fields that ADO rejects are retried without them.
+    Unknown/custom fields that ADO rejects are retried without them, and the
+    missing field names are cached in `_KNOWN_MISSING_FIELDS` so subsequent
+    test case creations skip them up front (avoiding repeated retries).
     """
     org = urllib.parse.quote(ADO_ORG)
     project = urllib.parse.quote(ADO_PROJECT)
@@ -1371,6 +1380,24 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
         priority = priority_map.get(priority, 2)
 
+    # Build the tag list. Always include "Gen-AI" plus the test_type and
+    # test_category (from extra_fields) so they are visible in ADO even when
+    # the project's process template lacks Custom.TestType / Custom.TestCategory.
+    # Tags in ADO are semicolon-separated.
+    tag_parts = ["Gen-AI"]
+    if extra_fields:
+        tt = (extra_fields.get('Custom.TestType') or '').strip()
+        tc_cat = (extra_fields.get('Custom.TestCategory') or '').strip()
+        # "Smoke & Regression" -> two separate tags so both are filterable in ADO
+        if tt:
+            for piece in re.split(r'\s*&\s*|\s*,\s*|\s*/\s*', tt):
+                piece = piece.strip()
+                if piece and piece not in tag_parts:
+                    tag_parts.append(piece)
+        if tc_cat and tc_cat not in tag_parts:
+            tag_parts.append(tc_cat)
+    tags_value = "; ".join(tag_parts)
+
     patch_doc = [
         {"op": "add", "path": "/fields/System.Title", "value": tc_title},
         {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.Steps", "value": steps_xml},
@@ -1378,8 +1405,8 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         {"op": "add", "path": "/fields/System.IterationPath", "value": iteration_path},
         {"op": "add", "path": "/fields/Microsoft.VSTS.Common.Priority", "value": priority},
         {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.AutomationStatus", "value": automation_status},
-        # Tag every AI-generated test case with Gen-AI
-        {"op": "add", "path": "/fields/System.Tags", "value": "Gen-AI"},
+        # Tag with Gen-AI + the test type (Smoke / Regression / etc.) + category
+        {"op": "add", "path": "/fields/System.Tags", "value": tags_value},
     ]
 
     # ── Objective → System.Description (the "Summary" area on the Test Case form)
@@ -1414,6 +1441,13 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         'Authorization': f'Basic {b64_pat}'
     }
 
+    # Pre-filter: drop any fields we already know this project's template
+    # rejects, so we don't waste a round-trip on the inevitable retry.
+    if _KNOWN_MISSING_FIELDS:
+        patch_doc = [p for p in patch_doc if not any(
+            p['path'].endswith(f'/{ref}') for ref in _KNOWN_MISSING_FIELDS
+        )]
+
     try:
         resp = requests.post(url, headers=patch_headers, json=patch_doc, verify=False, timeout=30)
         if resp.status_code >= 400:
@@ -1427,10 +1461,14 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
             optional_refs.add('Custom.ObjectivesandPreconditions')
             optional_refs.add('Microsoft.VSTS.TCM.Preconditions')
 
-            # Detect any specific TF51535 "Cannot find field X" error and drop X
-            missing = re.findall(r"Cannot find field ([A-Za-z0-9_.]+)", err_text)
+            # Detect any specific TF51535 "Cannot find field X" error and drop X.
+            # Use a non-greedy capture that stops at whitespace, dot+space, or quote
+            # so we don't accidentally swallow the trailing sentence period.
+            missing = re.findall(r"Cannot find field ([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)", err_text)
             for m in missing:
                 optional_refs.add(m)
+                # Remember it for future calls in this run.
+                _KNOWN_MISSING_FIELDS.add(m)
 
             print(f"  Retry without optional fields (ADO error: {err_text[:160]})")
             core_doc = [p for p in patch_doc if not any(
@@ -1665,7 +1703,14 @@ def generate_and_push_test_cases(story_id):
                     s = re.sub(r'\bAC\s*Reference\b\s*[:\-]?\s*[^<\n\r]*', '', s, flags=re.IGNORECASE)
                     s = re.sub(r'\bAC\s*\d+\b[:\-\.\)]?\s*', '', s, flags=re.IGNORECASE)
                     s = re.sub(r'\bacceptance\s+criteri(?:on|a)\b[:\-]?\s*', '', s, flags=re.IGNORECASE)
+                    # Strip internal rule-ID tags such as "(RULE FUNC 11)", "RULE GEN 01.5",
+                    # "RULE COV 08 / RULE DATA 09" — these are authoring guidelines and
+                    # should never appear in business-facing test case content.
+                    s = re.sub(r'\(\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?(?:\s*[/,]\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?)*\s*\)',
+                               '', s, flags=re.IGNORECASE)
+                    s = re.sub(r'\bRULE\s+[A-Z]+\s*\d+(?:\.\d+)?\b', '', s, flags=re.IGNORECASE)
                     s = re.sub(r'[ \t]{2,}', ' ', s)
+                    s = re.sub(r'\s+([.,;:])', r'\1', s)  # tidy stray space before punctuation
                     return s.strip()
 
                 for tc in selected_tcs:

@@ -49,7 +49,7 @@ Given a **User Story ID**, the script will:
 
 ```powershell
 # Just pass the User Story ID as an argument
-python test/ado_advisor.py 417882
+python test/ado_advisor.py 432288
 ```
 
 **Output:**
