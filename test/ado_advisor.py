@@ -555,8 +555,14 @@ def get_work_item_full_details(work_item_id):
 
 def generate_test_cases_from_acceptance_criteria(work_item):
     """
-    Rules-based test case generator.  Follows every rule in Rules.md.
+    Rules-based test case generator. Strictly follows Rules.md.
     Returns (test_cases_list, ac_clean, desc_clean, title).
+
+    Each test case dict contains all RULE GEN 01 mandatory attributes:
+      title, objective, preconditions, steps, expected (per step list),
+      overall_expected, priority (1-4), test_type, test_category,
+      review_status, automation_state, area_path, iteration_path,
+      application_name, application_module, ac_ref
     """
     if not work_item:
         return [], '', '', ''
@@ -565,316 +571,469 @@ def generate_test_cases_from_acceptance_criteria(work_item):
     title = fields.get('System.Title', '')
     description = fields.get('System.Description', '')
     acceptance_criteria = fields.get('Microsoft.VSTS.Common.AcceptanceCriteria', '')
+    area_path = fields.get('System.AreaPath', '')
+    iteration_path = fields.get('System.IterationPath', '')
 
     ac_clean = clean_html(acceptance_criteria) if acceptance_criteria else ''
     desc_clean = clean_html(description) if description else ''
     combined = (title + ' ' + desc_clean + ' ' + ac_clean).lower()
 
-    # ── Parse acceptance criteria blocks ───────────────────────────────────
     ac_blocks = _parse_ac_blocks(ac_clean)
 
-    # ── Detect story characteristics for rule application ─────────────────
-    has_roles = any(kw in combined for kw in ['admin', 'role', 'permission', 'user role', 'manager', 'approver', 'unauthorized'])
-    has_data_input = any(kw in combined for kw in ['input', 'enter', 'form', 'field', 'submit', 'upload', 'fill', 'type', 'select', 'dropdown'])
-    has_ui = any(kw in combined for kw in ['button', 'click', 'screen', 'page', 'modal', 'dialog', 'menu', 'tab', 'display', 'ui', 'dropdown', 'tooltip', 'grid', 'table'])
-    has_save = any(kw in combined for kw in ['save', 'submit', 'create', 'update', 'edit', 'add', 'post', 'put'])
-    has_cancel = any(kw in combined for kw in ['cancel', 'back', 'discard', 'close', 'reset'])
-    has_messages = any(kw in combined for kw in ['message', 'toast', 'notification', 'alert', 'error', 'success', 'warning', 'confirm'])
-    has_navigation = any(kw in combined for kw in ['navigate', 'redirect', 'route', 'link', 'menu', 'breadcrumb', 'tab'])
+    # ── Detect story characteristics for conditional rule application ─────
+    has_roles = any(kw in combined for kw in [
+        'admin', 'role', 'permission', 'manager', 'approver', 'unauthorized', 'authoriz'
+    ])
+    has_data_input = any(kw in combined for kw in [
+        'input', 'enter', 'form', 'field', 'submit', 'upload', 'fill', 'dropdown'
+    ])
+    has_ui = any(kw in combined for kw in [
+        'button', 'click', 'screen', 'page', 'modal', 'dialog', 'menu', 'tab',
+        'display', 'ui', 'dropdown', 'tooltip', 'grid', 'table', 'view'
+    ])
+    has_api = any(kw in combined for kw in [
+        'api', 'endpoint', 'webhook', 'service', 'request', 'response', 'http'
+    ])
 
-    # Detect roles mentioned
+    # Determine roles
+    role_keywords = {
+        'admin': 'Admin', 'administrator': 'Admin', 'manager': 'Manager',
+        'approver': 'Approver', 'reviewer': 'Reviewer', 'operator': 'Operator',
+        'editor': 'Editor', 'viewer': 'Viewer'
+    }
     roles_found = []
-    for role_kw in ['admin', 'administrator', 'manager', 'approver', 'reviewer', 'user', 'operator', 'viewer', 'editor']:
-        if role_kw in combined:
-            roles_found.append(role_kw.capitalize())
+    for kw, label in role_keywords.items():
+        if kw in combined and label not in roles_found:
+            roles_found.append(label)
     if not roles_found:
-        roles_found = ['Authorized User']
+        roles_found = ['User']
+
+    # Detect best-fit Application Module from title/description
+    module = _infer_application_module(combined)
+
+    # Default category derivation
+    default_category = 'API' if has_api else 'Functional'
+    default_test_type = 'Smoke & Regression'
+
+    # Common defaults applied to every test case (RULE GEN 01)
+    base_defaults = {
+        'review_status': 'NO',
+        'automation_state': 'Non-Automatable',
+        'area_path': area_path,
+        'iteration_path': iteration_path,
+        'application_name': 'EPP',
+        'application_module': module,
+    }
 
     test_cases = []
-    tc_counter = [0]  # mutable counter
 
-    def next_tc_id():
-        tc_counter[0] += 1
-        return f"TC-{tc_counter[0]:03d}"
+    def add_tc(tc):
+        """Merge defaults and append. Enforces RULE GEN 02 title format."""
+        for k, v in base_defaults.items():
+            tc.setdefault(k, v)
+        tc['title'] = _normalize_title(tc['title'])
+        # Ensure expected is a list aligned to steps for "expected per step" (RULE GEN 01.5)
+        steps = tc.get('steps', [])
+        exps = tc.get('expected', [])
+        if isinstance(exps, str):
+            exps = [''] * (len(steps) - 1) + [exps] if steps else [exps]
+        if len(exps) < len(steps):
+            exps += [''] * (len(steps) - len(exps))
+        tc['expected'] = exps
+        test_cases.append(tc)
+
+    feature_label = _short_feature(title)
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-COV-01 / RULE-GEN-03: 2 test cases per AC (min 1, max 4)
-    # RULE-COV-02: Validate Given/When/Then without prefixes
+    # RULE GEN 03: 1 test case per AC (the AC-coverage minimum)
     # ══════════════════════════════════════════════════════════════════════
     for i, ac_block in enumerate(ac_blocks, 1):
         given_match = re.search(r'GIVEN\s+(.+?)(?=WHEN|THEN|$)', ac_block, re.IGNORECASE | re.DOTALL)
         when_match = re.search(r'WHEN\s+(.+?)(?=THEN|$)', ac_block, re.IGNORECASE | re.DOTALL)
         then_match = re.search(r'THEN\s+(.+?)$', ac_block, re.IGNORECASE | re.DOTALL)
 
-        given_text = given_match.group(1).strip() if given_match else ''
-        when_text = when_match.group(1).strip() if when_match else ''
-        then_text = then_match.group(1).strip() if then_match else ''
+        given_text = _clean_clause(given_match.group(1)) if given_match else ''
+        when_text = _clean_clause(when_match.group(1)) if when_match else ''
+        then_text = _clean_clause(then_match.group(1)) if then_match else ''
 
-        ac_summary = ac_block[:100].replace('\n', ' ').strip()
+        ac_summary = _clean_clause(ac_block[:200])
         if ac_summary.upper().startswith('AC'):
             ac_summary = ac_summary.split(':', 1)[-1].strip() if ':' in ac_summary else ac_summary[4:].strip()
 
-        # ── TC 1: Positive / happy path per AC ────────────────────────────
-        steps_pos = []
-        if given_text:
-            steps_pos.append(f"Ensure {given_text}")
-        if when_text:
-            steps_pos.append(f"Perform action: {when_text}")
+        # ── Build steps & per-step expected — follow Rules.md sample format
+        # (clear imperative actions, no "Ensure/Perform/Validate" prefixes).
+        actor_label = roles_found[0] if has_roles else 'User'
+        steps = []
+        exps = []
+
+        # Step 1 — Login (always present, gives a concrete starting point)
+        steps.append(f"Log in to EPP as a {actor_label}")
+        exps.append(f"{actor_label} is successfully logged in")
+
+        # Step 2 — Navigate to the feature
+        steps.append(f"Navigate to the {feature_label} screen / functionality")
+        exps.append(f"{feature_label} screen is displayed")
+
+        # Step 3 — Set up preconditions from GIVEN (only if non-trivial)
+        if given_text and len(given_text) > 5:
+            steps.append(_imperative(given_text))
+            exps.append("Precondition state is established successfully")
+
+        # Step 4 — Trigger the action from WHEN (or fall back to AC summary)
+        action_text = when_text or ac_summary
+        if action_text:
+            steps.append(_imperative(action_text))
+            exps.append("Action is executed without errors")
+
+        # Step 5 — Validate the outcome from THEN (do NOT mention "AC" in steps)
         if then_text:
-            steps_pos.append(f"Verify {then_text}")
-        if not steps_pos:
-            steps_pos = [
-                "Navigate to the relevant feature",
-                f"Execute the scenario: {ac_summary[:120]}",
-                "Verify the expected outcome is achieved"
-            ]
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify {ac_summary[:80]}",
-            'preconditions': given_text if given_text else "User is logged in with appropriate permissions",
-            'steps': steps_pos,
-            'expected': then_text if then_text else f"System behaves as specified in AC{i}",
-            'overall_expected': f"AC{i} is fully satisfied",
-            'postconditions': "System state is updated correctly",
-            'priority': 'High',
-            'test_type': 'Functional',
-            'ac_ref': f'AC{i}',
-        })
+            steps.append("Verify the system response against the expected business outcome")
+            exps.append(then_text)
+        else:
+            steps.append("Verify the resulting behavior matches the objective of this test")
+            exps.append("System behavior matches the objective stated in the test case")
 
-        # ── TC 2: Negative / boundary per AC ──────────────────────────────
-        steps_neg = []
-        if given_text:
-            steps_neg.append(f"Ensure {given_text}")
-        steps_neg.append(f"Attempt the action with invalid or missing data related to: {ac_summary[:80]}")
-        steps_neg.append("Verify an appropriate error message is displayed")
-        steps_neg.append("Verify the system does not save invalid data")
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify error handling for {ac_summary[:70]}",
-            'preconditions': given_text if given_text else "User is logged in",
-            'steps': steps_neg,
-            'expected': "System rejects invalid input and shows a clear error message",
-            'overall_expected': f"AC{i} negative path is validated",
-            'postconditions': "No unintended data is persisted",
-            'priority': 'High',
-            'test_type': 'Negative',
-            'ac_ref': f'AC{i}',
+        # ── RULE GEN 02 — clean, business-friendly title per AC ──────────
+        condition = _build_condition_phrase(then_text or when_text or ac_summary)
+        actor = roles_found[0] if has_roles else 'system'
+        ac_title = f"{feature_label} {condition}" if condition else feature_label
+
+        add_tc({
+            'title': ac_title,
+            'objective': f"Validate the requirement of '{title}': {ac_summary[:240]}",
+            'preconditions': given_text if given_text else f"{actor.capitalize()} is logged in to EPP with the appropriate role",
+            'steps': steps,
+            'expected': exps,
+            'overall_expected': then_text if then_text else "The requirement is fully satisfied",
+            'priority': 2,
+            'test_type': default_test_type,
+            'test_category': default_category,
+            'ac_ref': f'AC{i}',  # internal mapping only — not shown anywhere user-visible
         })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-GEN-03: 2 happy-path positives (if not already covered by ACs)
+    # RULE GEN 03: At least 1 Happy Path (positive) for authorized role
     # ══════════════════════════════════════════════════════════════════════
-    happy_count = sum(1 for tc in test_cases if tc['test_type'] == 'Functional')
-    if happy_count < 2:
-        for _ in range(2 - happy_count):
-            test_cases.append({
-                'title': f"[{next_tc_id()}] Verify {title[:70]} completes successfully",
-                'preconditions': "User is logged in with authorized role",
+    if not any(tc['test_category'] == 'Functional' or tc['test_category'] == 'API' for tc in test_cases):
+        actor = roles_found[0]
+        add_tc({
+            'title': f"{feature_label} works end-to-end with valid inputs",
+            'objective': f"Validate end-to-end happy path for '{title}'",
+            'preconditions': f"{actor} is logged in to EPP with the required permissions",
+            'steps': [
+                f"Log in to EPP as a {actor}",
+                f"Navigate to the {feature_label} screen",
+                "Provide all required inputs with valid data",
+                "Trigger the primary action (e.g., Submit / Save / Send)",
+                "Observe the system response and confirmation feedback",
+            ],
+            'expected': [
+                f"{actor} is successfully logged in",
+                f"{feature_label} screen is displayed",
+                "Inputs are accepted without validation errors",
+                "Action is processed successfully by the system",
+                "Success message / confirmation is displayed and data is persisted",
+            ],
+            'overall_expected': "Happy path completes successfully and data is persisted",
+            'priority': 1,
+            'test_type': 'Smoke',
+            'test_category': default_category,
+            'ac_ref': 'Happy Path',
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RULE GEN 03: At least 1 Negative / Boundary / Unauthorized
+    # ══════════════════════════════════════════════════════════════════════
+    if not any(tc['test_category'] == 'Negative' for tc in test_cases):
+        if has_roles:
+            add_tc({
+                'title': f"Unauthorized user is blocked from {feature_label}",
+                'objective': "Validate that unauthorized roles cannot perform the action (RULE FUNC 11)",
+                'preconditions': "A user account without the required permissions exists",
                 'steps': [
-                    "Navigate to the feature described in the user story",
-                    "Perform the primary action with valid data",
-                    "Verify the operation completes successfully",
-                    "Verify confirmation/success feedback is shown"
+                    "Log in to EPP as a user without the required role/permissions",
+                    f"Navigate to the {feature_label} screen (or attempt to invoke its API)",
+                    "Attempt to perform the primary action",
+                    "Observe the system response",
                 ],
-                'expected': "Feature works as described in the user story",
-                'overall_expected': "Happy path is validated end-to-end",
-                'postconditions': "System state is updated accordingly",
-                'priority': 'High',
-                'test_type': 'Functional',
-                'ac_ref': 'All ACs',
+                'expected': [
+                    "User is logged in",
+                    "Screen access is denied OR the action control is hidden/disabled",
+                    "System rejects the action attempt",
+                    "An appropriate access-denied error message is shown and no data changes occur",
+                ],
+                'overall_expected': "Unauthorized users cannot use the feature and no data is modified",
+                'priority': 1,
+                'test_type': 'Regression',
+                'test_category': 'Negative',
+                'ac_ref': 'Security',
+            })
+        else:
+            actor = roles_found[0]
+            add_tc({
+                'title': f"System rejects invalid inputs for {feature_label}",
+                'objective': "Validate boundary / negative behavior (RULE FUNC 11)",
+                'preconditions': f"{actor} is logged in to EPP",
+                'steps': [
+                    f"Log in to EPP as a {actor}",
+                    f"Navigate to the {feature_label} screen",
+                    "Submit invalid / out-of-range / empty inputs",
+                    "Observe the validation behavior",
+                ],
+                'expected': [
+                    f"{actor} is successfully logged in",
+                    f"{feature_label} screen is displayed",
+                    "Submission is blocked",
+                    "A clear, user-friendly error message is shown next to the offending field",
+                ],
+                'overall_expected': "Invalid inputs are rejected gracefully and no data is saved",
+                'priority': 2,
+                'test_type': 'Regression',
+                'test_category': 'Negative',
+                'ac_ref': 'Negative',
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-GEN-03: At least 1 negative/boundary/edge/unauthorized test
-    # ══════════════════════════════════════════════════════════════════════
-    neg_count = sum(1 for tc in test_cases if tc['test_type'] in ('Negative', 'Boundary'))
-    if neg_count < 1:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify unauthorized access is denied for {title[:60]}",
-            'preconditions': "User is logged in with an unauthorized role",
-            'steps': [
-                "Log in with a user that does NOT have the required permissions",
-                "Attempt to access or perform the feature action",
-                "Verify access is denied with an appropriate message",
-                "Verify no data changes occur"
-            ],
-            'expected': "Unauthorized users cannot access the feature",
-            'overall_expected': "Security boundary is enforced",
-            'postconditions': "No data corruption; access attempt is logged",
-            'priority': 'High',
-            'test_type': 'Negative',
-            'ac_ref': 'Security',
-        })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # RULE-COV-03: Role-based test cases
+    # RULE COV 07: Role-Based Test Generation
     # ══════════════════════════════════════════════════════════════════════
     if has_roles and len(roles_found) > 1:
         for role in roles_found[:3]:
-            test_cases.append({
-                'title': f"[{next_tc_id()}] Verify {title[:50]} as {role}",
-                'preconditions': f"User is logged in with the {role} role",
+            add_tc({
+                'title': f"{role} can perform {feature_label} per role permissions",
+                'objective': f"Validate role-specific behavior for {role}",
+                'preconditions': f"A user account with the {role} role exists",
                 'steps': [
-                    f"Log in as a user with {role} role",
-                    "Navigate to the feature",
-                    f"Perform the action as {role}",
-                    f"Verify the behavior matches what is expected for the {role} role"
+                    f"Log in to EPP as a {role}",
+                    f"Navigate to the {feature_label} screen",
+                    f"Perform the primary action available to a {role}",
+                    "Verify the resulting state and any role-specific UI/behavior",
                 ],
-                'expected': f"Feature behaves correctly for the {role} role",
-                'overall_expected': f"Role-specific behavior for {role} is validated",
-                'postconditions': "N/A",
-                'priority': 'Medium',
-                'test_type': 'Functional',
-                'ac_ref': 'Role-based',
+                'expected': [
+                    f"{role} is successfully logged in",
+                    f"{feature_label} screen is displayed",
+                    "Action completes successfully",
+                    f"Outcome matches the business rules defined for the {role} role",
+                ],
+                'overall_expected': f"Behavior is correct for the {role} role",
+                'priority': 2,
+                'test_type': 'Regression',
+                'test_category': 'Functional',
+                'ac_ref': f'Role: {role}',
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-COV-04: Data input test cases
+    # RULE COV 08 + RULE DATA 09: Data-Driven Coverage (only if data input)
     # ══════════════════════════════════════════════════════════════════════
     if has_data_input:
-        data_tests = [
-            ("valid data", "Enter all fields with valid data and submit", "Data is accepted and saved", "Functional"),
-            ("invalid data", "Enter fields with invalid data (wrong format, out-of-range) and submit", "Validation errors are displayed; data is not saved", "Negative"),
-            ("empty/null input", "Leave all required fields empty and submit", "Required-field validation errors are displayed", "Boundary"),
-            ("special characters", "Enter special characters (!@#$%^&*) in text fields and submit", "System handles special characters correctly (sanitize or accept)", "Boundary"),
-            ("max/min length", "Enter values at maximum and minimum allowed lengths and submit", "System accepts boundary-length values correctly", "Boundary"),
+        actor = roles_found[0]
+        data_variants = [
+            ('valid data', 'Functional', 2,
+             'Submission succeeds; data is saved',
+             'Enter valid values in all required fields'),
+            ('invalid data', 'Negative', 2,
+             'Validation error is displayed; no data is saved',
+             'Enter invalid values (wrong format, out-of-range) in the form'),
+            ('empty/null inputs', 'Negative', 2,
+             'Required-field validation errors are displayed',
+             'Leave all required fields empty'),
+            ('special characters', 'Functional', 3,
+             'Special characters are handled / sanitized correctly',
+             'Enter special characters (!@#$%^&*<>) in text fields'),
+            ('maximum-length values', 'Functional', 3,
+             'Boundary-length value is accepted and saved correctly',
+             'Enter values at the maximum allowed length in each text field'),
+            ('minimum-length values', 'Functional', 3,
+             'Boundary-length value is accepted and saved correctly',
+             'Enter values at the minimum allowed length in each text field'),
         ]
-        for label, action, expected, ttype in data_tests:
-            test_cases.append({
-                'title': f"[{next_tc_id()}] Verify {title[:50]} with {label}",
-                'preconditions': "User is logged in; data entry form is accessible",
+        for label, cat, prio, expected, action_step in data_variants:
+            add_tc({
+                'title': f"{feature_label} submission with {label}",
+                'objective': f"Validate data-input handling for {label} (RULE COV 08 / RULE DATA 09)",
+                'preconditions': (f"{actor} is logged in; the data entry form is accessible. "
+                                  f"Test data source: CSV (header + valid + invalid + boundary rows + comment column)"),
                 'steps': [
-                    "Navigate to the data entry form/screen",
-                    action,
-                    f"Verify: {expected}"
+                    f"Log in to EPP as a {actor}",
+                    f"Navigate to the {feature_label} data entry form",
+                    action_step,
+                    "Click the Submit button",
+                    "Observe the system response",
                 ],
-                'expected': expected,
-                'overall_expected': f"Data input {label} scenario is validated",
-                'postconditions': "System state reflects the correct outcome",
-                'priority': 'Medium',
-                'test_type': ttype,
-                'ac_ref': 'Data Input',
+                'expected': [
+                    f"{actor} is successfully logged in",
+                    "Data entry form is displayed",
+                    "Inputs are entered into the fields as specified",
+                    "Submit action is processed",
+                    expected,
+                ],
+                'overall_expected': expected,
+                'priority': prio,
+                'test_type': 'Regression',
+                'test_category': cat,
+                'ac_ref': f'Data: {label}',
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-FUNC-01: UI elements validation
+    # RULE FUNC 10: UI & Field Validation (only if UI mentioned)
     # ══════════════════════════════════════════════════════════════════════
     if has_ui:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify UI elements for {title[:60]}",
-            'preconditions': "User is logged in; feature screen is accessible",
+        actor = roles_found[0]
+        add_tc({
+            'title': f"UI elements render correctly on {feature_label} screen",
+            'objective': "Validate visibility, enable/disable state, mandatory fields and default values (RULE FUNC 10)",
+            'preconditions': f"{actor} is logged in; the {feature_label} screen is accessible",
             'steps': [
-                "Navigate to the feature screen",
-                "Verify all buttons, dropdowns, forms, and modals are present and correctly labeled",
-                "Verify enabled/disabled states match the current context",
-                "Verify tooltips and placeholder text are correct",
-                "Verify keyboard navigation and tab order"
+                f"Log in to EPP as a {actor}",
+                f"Navigate to the {feature_label} screen",
+                "Verify each UI element (buttons, dropdowns, fields, labels) is visible and labeled correctly",
+                "Verify the enable/disable state of each control matches the business rule for the current context",
+                "Verify mandatory-field markers (e.g., red asterisk) are present on required fields",
+                "Verify default values pre-populated in the fields are correct",
             ],
-            'expected': "All UI elements are present, correctly styled, and functional",
-            'overall_expected': "UI elements comply with design specifications",
-            'postconditions': "N/A",
-            'priority': 'Medium',
-            'test_type': 'UI',
+            'expected': [
+                f"{actor} is successfully logged in",
+                f"{feature_label} screen is displayed",
+                "All UI elements are visible and labeled per design specification",
+                "Enable/disable state matches business rules",
+                "Mandatory markers are displayed on required fields",
+                "Default values match the specification",
+            ],
+            'overall_expected': "All UI elements meet design specifications",
+            'priority': 3,
+            'test_type': 'Smoke & Regression',
+            'test_category': 'Functional',
             'ac_ref': 'UI',
         })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE-FUNC-02: Navigation flow
-    # ══════════════════════════════════════════════════════════════════════
-    if has_navigation:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify navigation flow for {title[:60]}",
-            'preconditions': "User is logged in",
-            'steps': [
-                "Start from the application entry point (dashboard/home)",
-                "Navigate to the feature using the expected path (menu/link/button)",
-                "Complete the feature workflow",
-                "Verify the user is redirected to the correct exit point",
-                "Verify browser back/forward buttons work correctly"
-            ],
-            'expected': "Navigation flow from entry to exit point works as expected",
-            'overall_expected': "Complete navigation path is validated",
-            'postconditions': "N/A",
-            'priority': 'Medium',
-            'test_type': 'Functional',
-            'ac_ref': 'Navigation',
-        })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # RULE-FUNC-03: Messages validation
-    # ══════════════════════════════════════════════════════════════════════
-    if has_messages:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify messages and notifications for {title[:55]}",
-            'preconditions': "User is logged in; feature is accessible",
-            'steps': [
-                "Perform a successful action and verify the success message/toast appears",
-                "Perform an invalid action and verify the error message appears",
-                "Verify messages auto-dismiss or can be dismissed manually",
-                "Verify message text is clear and user-friendly"
-            ],
-            'expected': "All success, error, and informational messages display correctly",
-            'overall_expected': "Messaging behavior is validated",
-            'postconditions': "N/A",
-            'priority': 'Medium',
-            'test_type': 'Functional',
-            'ac_ref': 'Messages',
-        })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # RULE-FUNC-04: Data persistence
-    # ══════════════════════════════════════════════════════════════════════
-    if has_save:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify data persists after save/submit for {title[:50]}",
-            'preconditions': "User is logged in; data entry form is accessible",
-            'steps': [
-                "Enter valid data in all fields",
-                "Click Save/Submit",
-                "Navigate away from the page",
-                "Return to the same page/record",
-                "Verify all previously entered data is correctly persisted"
-            ],
-            'expected': "Data is saved correctly and persists after navigation",
-            'overall_expected': "Data persistence is validated",
-            'postconditions': "Data is stored in the system",
-            'priority': 'High',
-            'test_type': 'Functional',
-            'ac_ref': 'Persistence',
-        })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # RULE-FUNC-05: Cancel/back does NOT save
-    # ══════════════════════════════════════════════════════════════════════
-    if has_cancel or has_save:
-        test_cases.append({
-            'title': f"[{next_tc_id()}] Verify cancel/back does not save data for {title[:50]}",
-            'preconditions': "User is logged in; data entry form is accessible",
-            'steps': [
-                "Enter data in the form fields",
-                "Click Cancel or navigate back without saving",
-                "Return to the same page/record",
-                "Verify that the unsaved data was NOT persisted"
-            ],
-            'expected': "No data is saved when user cancels or navigates back",
-            'overall_expected': "Cancel/back behavior is validated",
-            'postconditions': "No unintended data in the system",
-            'priority': 'Medium',
-            'test_type': 'Functional',
-            'ac_ref': 'Cancel/Back',
-        })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # RULE-GEN-04: Club similar-outcome test cases  (deduplicate by title prefix)
+    # RULE GEN 04 + RULE MAINT 12: Club / dedupe similar-outcome test cases
     # ══════════════════════════════════════════════════════════════════════
     seen_keys = set()
     deduped = []
     for tc in test_cases:
-        key = tc['title'][10:50]  # ignore [TC-NNN] prefix, compare core
+        key = (tc['title'].lower()[:60], tc['test_category'], tc.get('ac_ref', ''))
         if key not in seen_keys:
             seen_keys.add(key)
             deduped.append(tc)
     test_cases = deduped
 
     return test_cases, ac_clean, desc_clean, title
+
+
+def _short_feature(title):
+    """Short, business-friendly feature label from a user story title."""
+    t = re.sub(r'^(EPP[:\-]\s*)', '', title, flags=re.IGNORECASE).strip()
+    # Strip trailing punctuation
+    t = t.rstrip(' .:;-–—')
+    return t[:80]
+
+
+def _imperative(text):
+    """Convert an AC clause into a clean imperative test step.
+
+    - Strips leading "the user", "user", "system", "they"
+    - Replaces "should", "shall", "will" with active verbs
+    - Capitalises the first letter
+    - Trims length to 200 chars
+    """
+    if not text:
+        return ''
+    t = re.sub(r'\s+', ' ', text).strip()
+    # Drop leading subject if present
+    t = re.sub(r'^(the\s+)?(user|system|they|application|app)\s+(can\s+|should\s+|shall\s+|will\s+|is\s+able\s+to\s+)?',
+               '', t, flags=re.IGNORECASE)
+    # Convert "should be / shall be / will be" to "Verify ..."
+    t = re.sub(r'^should\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^shall\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^will\s+', '', t, flags=re.IGNORECASE)
+    t = t.strip(' .:;-–—')
+    if not t:
+        return ''
+    # Capitalise first letter
+    t = t[0].upper() + t[1:]
+    if len(t) > 200:
+        t = t[:197] + '...'
+    return t
+
+
+def _clean_clause(text):
+    """Sanitize a Given/When/Then clause: collapse whitespace, strip leading
+    bullets/dashes/punctuation, drop trailing punctuation. Also strips any
+    'AC<n>' or 'Acceptance Criteria' labels — those are internal references
+    and must never appear in user-visible test step text."""
+    if not text:
+        return ''
+    t = re.sub(r'\s+', ' ', text).strip()
+    t = re.sub(r'^[\-\u2013\u2014\u2022\*\>\s]+', '', t)  # leading dashes/bullets
+    t = re.sub(r'^(and|or|that)\b\s+', '', t, flags=re.IGNORECASE)
+    # Strip AC labels anywhere in the clause
+    t = re.sub(r'\bAC\s*\d+\b[:\-\.\)]?\s*', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bacceptance\s+criteri(?:on|a)\b[:\-]?\s*', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s{2,}', ' ', t)
+    t = t.rstrip(' .:;,-\u2013\u2014')
+    return t
+
+
+def _build_condition_phrase(text):
+    """Turn a free-form GWT clause into a short, business-readable
+    'condition / business rule' phrase suitable for a test case title.
+    Returns at most ~70 chars, stripped of dashes, AC labels and filler.
+    """
+    t = _clean_clause(text)
+    if not t:
+        return ''
+    # Drop common AC noise
+    t = re.sub(r'\bAC\s*\d+\b[:\-]?\s*', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(the\s+)?(system|user|application)\s+(should|will|must|shall)\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(verify|validate|ensure|check)\s+', '', t, flags=re.IGNORECASE)
+    # Take first meaningful sentence/clause only
+    t = re.split(r'[.;]\s+', t)[0]
+    t = re.sub(r'\s+', ' ', t).strip()
+    # Limit length, cut at last word boundary
+    if len(t) > 70:
+        cut = t[:70].rsplit(' ', 1)[0]
+        t = cut
+    return t
+
+
+def _normalize_title(t):
+    """RULE GEN 02 — start with 'Verify', no 'that', collapse whitespace,
+    no trailing punctuation, max 120 chars."""
+    t = re.sub(r'\s+', ' ', t or '').strip()
+    t = re.sub(r'\bthat\b\s*', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^[\-\u2013\u2014\s]+', '', t)
+    t = t.rstrip(' .:;,-\u2013\u2014')
+    if not t.lower().startswith('verify'):
+        t = 'Verify ' + t
+    t = re.sub(r'\s+', ' ', t).strip()
+    if len(t) > 120:
+        cut = t[:120].rsplit(' ', 1)[0]
+        t = cut
+    return t
+
+
+def _infer_application_module(combined):
+    """Best-effort Application Module mapping (RULE GEN 01.14)."""
+    mapping = [
+        ('wire', 'Wire Payments'),
+        ('webhook', 'Integrations / Webhooks'),
+        ('resware', 'ResWare Integration'),
+        ('escrow', 'Escrow'),
+        ('payment', 'Payments'),
+        ('disburs', 'Disbursements'),
+        ('approval', 'Approvals'),
+        ('notification', 'Notifications'),
+        ('email', 'Notifications'),
+        ('report', 'Reporting'),
+        ('dashboard', 'Dashboard'),
+        ('login', 'Authentication'),
+        ('user', 'User Management'),
+    ]
+    for kw, mod in mapping:
+        if kw in combined:
+            return mod
+    return 'EPP Core'
 
 
 def _parse_ac_blocks(ac_clean):
@@ -1134,53 +1293,121 @@ def generate_test_cases_report_html(work_item_id):
 
 def format_steps_as_ado_xml(steps, expected=''):
     """
-    Convert a list of step strings into the Azure DevOps TCM Steps XML format.
-    ADO stores steps in Microsoft.VSTS.TCM.Steps as XML like:
-      <steps id="0" last="N">
-        <step id="1" type="ActionStep"><parameterizedString isformatted="true">...</parameterizedString>
-          <parameterizedString isformatted="true">expected</parameterizedString></step>
-        ...
-      </steps>
+    Convert a list of step strings into the Azure DevOps TCM Steps XML format
+    with per-step expected results (RULE GEN 01.5).
+
+    Each parameterizedString is `isformatted="true"`, meaning ADO expects HTML.
+    If the input already contains HTML (e.g. <b>, <br>), it is preserved.
+    Otherwise the text is HTML-escaped and wrapped in a <DIV><P>…</P></DIV> block
+    (the format the ADO Test Case form normally produces).
     """
+    from xml.sax.saxutils import escape
+
     if isinstance(steps, str):
-        # If steps is an HTML string, extract text from <li> tags
         items = re.findall(r'<li>(.*?)</li>', steps, re.DOTALL)
         if not items:
             items = [steps]
         steps = items
 
+    if isinstance(expected, list):
+        expected_list = expected
+    else:
+        expected_list = [''] * (len(steps) - 1) + [expected] if steps else [expected]
+    while len(expected_list) < len(steps):
+        expected_list.append('')
+
+    def _to_html(text):
+        text = (text or '').strip()
+        if not text:
+            return ''
+        # If text already contains HTML tags, preserve them; only escape stray '&'
+        if re.search(r'<[a-zA-Z/!][^>]*>', text):
+            # Only fix bare ampersands that are not entities
+            text = re.sub(r'&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', text)
+            return f'<DIV><P>{text}</P></DIV>'
+        # Plain text — escape and wrap
+        return f'<DIV><P>{escape(text)}</P></DIV>'
+
     xml_steps = []
     for idx, step_text in enumerate(steps, 1):
-        step_text_clean = step_text.strip()
-        # Last step gets the expected result
-        exp = expected if idx == len(steps) else ''
+        step_html = _to_html(step_text)
+        exp_html = _to_html(expected_list[idx - 1])
+        # The two parameterizedString contents must be XML-escaped at the outer
+        # level too (they are children of <parameterizedString>).
         xml_steps.append(
             f'<step id="{idx}" type="ActionStep">'
-            f'<parameterizedString isformatted="true">{step_text_clean}</parameterizedString>'
-            f'<parameterizedString isformatted="true">{exp}</parameterizedString>'
+            f'<parameterizedString isformatted="true">{escape(step_html)}</parameterizedString>'
+            f'<parameterizedString isformatted="true">{escape(exp_html)}</parameterizedString>'
+            f'<description/>'
             f'</step>'
         )
     last_id = len(steps)
     return f'<steps id="0" last="{last_id}">{"".join(xml_steps)}</steps>'
 
 
-def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, iteration_path):
+def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, iteration_path,
+                            priority=2, automation_status='Not Automated', extra_fields=None,
+                            objective_html=None, preconditions_field_html=None,
+                            description_html=None):
     """
-    Create a Test Case work item in Azure DevOps.
-    Returns the created work item JSON, or None on failure.
+    Create a Test Case work item in Azure DevOps with all RULE GEN 01 attributes.
+
+    Field mapping in ADO Test Case form:
+      - "Summary" (top of form)              -> System.Description       (Objective)
+      - "Preconditions" (Steps tab section)  -> Microsoft.VSTS.TCM.LocalDataSource is NOT it;
+                                                the actual field is Microsoft.VSTS.TCM.Preconditions
+      - "Steps"                              -> Microsoft.VSTS.TCM.Steps
+
+    `extra_fields` is a dict of additional ADO field reference names to set
+    (e.g., custom fields like Custom.TestCategory, Custom.ApplicationName).
+    Unknown/custom fields that ADO rejects are retried without them.
     """
     org = urllib.parse.quote(ADO_ORG)
     project = urllib.parse.quote(ADO_PROJECT)
     url = f"https://dev.azure.com/{org}/{project}/_apis/wit/workitems/$Test%20Case?api-version=7.1"
+
+    # ADO Priority field expects 1-4; map any string fallback
+    if isinstance(priority, str):
+        priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
+        priority = priority_map.get(priority, 2)
 
     patch_doc = [
         {"op": "add", "path": "/fields/System.Title", "value": tc_title},
         {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.Steps", "value": steps_xml},
         {"op": "add", "path": "/fields/System.AreaPath", "value": area_path},
         {"op": "add", "path": "/fields/System.IterationPath", "value": iteration_path},
-        # RULE-FUNC-07: Tag every AI-generated test case with Gen-AI
+        {"op": "add", "path": "/fields/Microsoft.VSTS.Common.Priority", "value": priority},
+        {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.AutomationStatus", "value": automation_status},
+        # Tag every AI-generated test case with Gen-AI
         {"op": "add", "path": "/fields/System.Tags", "value": "Gen-AI"},
     ]
+
+    # ── Objective → System.Description (the "Summary" area on the Test Case form)
+    if objective_html:
+        patch_doc.append({"op": "add", "path": "/fields/System.Description",
+                          "value": objective_html})
+    elif description_html:
+        patch_doc.append({"op": "add", "path": "/fields/System.Description",
+                          "value": description_html})
+    elif preconditions_html:
+        # Backward compat: legacy single-blob description
+        patch_doc.append({"op": "add", "path": "/fields/System.Description",
+                          "value": preconditions_html})
+
+    # ── Objectives & Preconditions → custom field on this project's process
+    #    template ("Objectives and Preconditions"). The standard
+    #    Microsoft.VSTS.TCM.Preconditions field does NOT exist here, so we
+    #    must use the custom reference name discovered via the field probe.
+    if preconditions_field_html:
+        patch_doc.append({"op": "add",
+                          "path": "/fields/Custom.ObjectivesandPreconditions",
+                          "value": preconditions_field_html})
+
+    if extra_fields:
+        for ref_name, value in extra_fields.items():
+            if value is None or value == '':
+                continue
+            patch_doc.append({"op": "add", "path": f"/fields/{ref_name}", "value": value})
 
     patch_headers = {
         'Content-Type': 'application/json-patch+json',
@@ -1190,7 +1417,28 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
     try:
         resp = requests.post(url, headers=patch_headers, json=patch_doc, verify=False, timeout=30)
         if resp.status_code >= 400:
-            print(f"  API Response: {resp.text[:300]}")
+            err_text = resp.text or ''
+            # Build set of "optional" field reference names that we should drop on retry:
+            # - any extra_fields
+            # - the "objectives & preconditions" custom field, in case template differs
+            optional_refs = set()
+            if extra_fields:
+                optional_refs.update(extra_fields.keys())
+            optional_refs.add('Custom.ObjectivesandPreconditions')
+            optional_refs.add('Microsoft.VSTS.TCM.Preconditions')
+
+            # Detect any specific TF51535 "Cannot find field X" error and drop X
+            missing = re.findall(r"Cannot find field ([A-Za-z0-9_.]+)", err_text)
+            for m in missing:
+                optional_refs.add(m)
+
+            print(f"  Retry without optional fields (ADO error: {err_text[:160]})")
+            core_doc = [p for p in patch_doc if not any(
+                p['path'].endswith(f'/{ref}') for ref in optional_refs
+            )]
+            resp = requests.post(url, headers=patch_headers, json=core_doc, verify=False, timeout=30)
+            if resp.status_code >= 400:
+                print(f"  API Response: {resp.text[:300]}")
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -1279,24 +1527,38 @@ def generate_and_push_test_cases(story_id):
     print(f"  Generated {len(test_cases_raw)} test cases.")
 
     # Prepare test cases data for JSON serialization
+    import uuid as _uuid
+    session_id = _uuid.uuid4().hex
     tc_data_list = []
     for idx, tc in enumerate(test_cases_raw):
         steps_list = tc['steps'] if isinstance(tc['steps'], list) else [tc['steps']]
+        expected_list = tc.get('expected', [])
+        if isinstance(expected_list, str):
+            expected_list = [expected_list]
         tc_data_list.append({
             'index': idx,
+            'uid': f"{session_id}-{idx}",
             'title': tc['title'],
+            'objective': tc.get('objective', ''),
             'preconditions': tc.get('preconditions', ''),
             'steps': steps_list,
-            'expected': tc.get('expected', ''),
+            'expected': expected_list,
             'overall_expected': tc.get('overall_expected', ''),
-            'postconditions': tc.get('postconditions', ''),
-            'priority': tc.get('priority', 'Medium'),
-            'test_type': tc.get('test_type', 'Functional'),
+            'priority': tc.get('priority', 2),
+            'test_type': tc.get('test_type', 'Smoke & Regression'),
+            'test_category': tc.get('test_category', 'Functional'),
+            'review_status': tc.get('review_status', 'NO'),
+            'automation_state': tc.get('automation_state', 'Non-Automatable'),
+            'area_path': tc.get('area_path', ''),
+            'iteration_path': tc.get('iteration_path', ''),
+            'application_name': tc.get('application_name', 'EPP'),
+            'application_module': tc.get('application_module', ''),
             'ac_ref': tc.get('ac_ref', ''),
         })
 
     story_context = {
         'story_id': story_id,
+        'session_id': session_id,
         'title': title,
         'state': state,
         'assignee': assignee,
@@ -1309,29 +1571,43 @@ def generate_and_push_test_cases(story_id):
 
     # ── Build Review HTML ──────────────────────────────────────────────────
     review_html = _build_review_html(story_context)
-    review_file = f"review_test_cases_US{story_id}.html"
+    reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'reports')
+    os.makedirs(reports_dir, exist_ok=True)
+    review_file = os.path.join(reports_dir, f"review_test_cases_US{story_id}.html")
     with open(review_file, 'w', encoding='utf-8') as f:
         f.write(review_html)
 
     # ── Local server to handle the "Add to ADO" action ─────────────────────
     server_result = {'done': False}
+    # Build a uid → tc lookup for stable identification (immune to re-orderings)
+    tc_by_uid = {tc['uid']: tc for tc in tc_data_list}
+    current_session_id = session_id
 
     class ReviewHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             pass  # suppress server logs
 
+        def _send_no_cache_headers(self):
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+
         def do_GET(self):
-            if self.path == '/' or self.path == '/review':
+            # Strip any querystring (e.g., cache-buster)
+            path = self.path.split('?', 1)[0]
+            if path == '/' or path == '/review':
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self._send_no_cache_headers()
                 self.end_headers()
                 with open(review_file, 'r', encoding='utf-8') as f:
                     self.wfile.write(f.read().encode('utf-8'))
-            elif self.path == '/status':
+            elif path == '/status':
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
+                self._send_no_cache_headers()
                 self.end_headers()
-                self.wfile.write(json.dumps({'status': 'ready'}).encode())
+                self.wfile.write(json.dumps({'status': 'ready', 'session_id': current_session_id}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1341,24 +1617,173 @@ def generate_and_push_test_cases(story_id):
                 content_length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(content_length).decode('utf-8')
                 selected = json.loads(body)
+                posted_session = selected.get('session_id', '')
+                selected_uids = selected.get('uids', [])
+                # Backward-compat: also accept indices, but only if session matches
                 selected_indices = selected.get('indices', [])
 
-                print(f"\n  Received request to add {len(selected_indices)} test cases to ADO...")
+                # ── Stale page guard: refuse to push if the page in the browser is
+                #    from a previous run (different session id). This prevents the
+                #    common pitfall where a cached/old review page submits indices
+                #    that no longer correspond to the latest generated test cases.
+                if posted_session and posted_session != current_session_id:
+                    msg = (f"Stale review page detected (session mismatch). "
+                           f"Please refresh the browser (Ctrl+F5) and try again.")
+                    print(f"  REFUSED: {msg}")
+                    self.send_response(409)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self._send_no_cache_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        'error': 'stale_session',
+                        'message': msg,
+                        'results': []
+                    }).encode())
+                    return
+
+                # Resolve selected test cases preferring uid (stable) over index
+                selected_tcs = []
+                if selected_uids:
+                    for uid in selected_uids:
+                        tc = tc_by_uid.get(uid)
+                        if tc is not None:
+                            selected_tcs.append(tc)
+                elif selected_indices:
+                    for idx in selected_indices:
+                        if 0 <= idx < len(tc_data_list):
+                            selected_tcs.append(tc_data_list[idx])
+
+                print(f"\n  Received request to add {len(selected_tcs)} test cases to ADO...")
 
                 results = []
-                for sel_idx in selected_indices:
-                    tc = tc_data_list[sel_idx]
-                    tc_title = f"[Auto] US#{story_id} - {tc['title']}"
-                    preconditions = tc.get('preconditions', '')
+                # Helper: scrub any leftover "AC<n>" / "AC Reference" / "Acceptance Criteria"
+                # tokens from any user-visible string before pushing to ADO.
+                def _scrub_ac(s):
+                    if not s:
+                        return s
+                    s = re.sub(r'\bAC\s*Reference\b\s*[:\-]?\s*[^<\n\r]*', '', s, flags=re.IGNORECASE)
+                    s = re.sub(r'\bAC\s*\d+\b[:\-\.\)]?\s*', '', s, flags=re.IGNORECASE)
+                    s = re.sub(r'\bacceptance\s+criteri(?:on|a)\b[:\-]?\s*', '', s, flags=re.IGNORECASE)
+                    s = re.sub(r'[ \t]{2,}', ' ', s)
+                    return s.strip()
+
+                for tc in selected_tcs:
+                    sel_idx = tc.get('index', -1)
+                    tc_title = _scrub_ac(tc['title'])  # RULE GEN 02
+                    preconditions = _scrub_ac(tc.get('preconditions', ''))
+                    objective = _scrub_ac(tc.get('objective', ''))
+                    overall_expected = _scrub_ac(tc.get('overall_expected', ''))
+                    # Scrub each step / expected as well
+                    tc_steps = [_scrub_ac(s) for s in (tc.get('steps') or [])]
+                    tc_expected = [_scrub_ac(e) for e in (tc.get('expected') or [])]
+
+                    # ── Build Steps so Objective + Preconditions are visible on the
+                    #    main Steps tab in ADO (most reliable place users see them).
                     full_steps = []
+                    full_expected = []
+                    if objective:
+                        full_steps.append(f"<b>Objective:</b> {objective}")
+                        full_expected.append("Objective is understood by the tester")
                     if preconditions:
-                        full_steps.append(f"[Precondition] {preconditions.replace(chr(10), ' | ')}")
-                    full_steps.extend(tc['steps'])
-                    steps_xml = format_steps_as_ado_xml(full_steps, tc.get('expected', ''))
-                    preconditions_html = f"<div>{preconditions.replace(chr(10), '<br>')}</div>" if preconditions else ''
+                        pre_html = preconditions.replace(chr(10), '<br>')
+                        full_steps.append(f"<b>Preconditions:</b><br>{pre_html}")
+                        full_expected.append("All preconditions are satisfied before execution begins")
+
+                    full_steps.extend(tc_steps)
+                    full_expected.extend(tc_expected or [])
+
+                    if overall_expected:
+                        full_steps.append("<b>Overall Expected Result</b>")
+                        full_expected.append(overall_expected)
+
+                    steps_xml = format_steps_as_ado_xml(full_steps, full_expected)
+
+                    # ── Objective HTML → goes into System.Description (the "Summary"
+                    #    box on the Test Case form, top of the page).
+                    objective_html = ''
+                    if objective:
+                        objective_html = (
+                            f"<div><b>Objective:</b><br>{objective}</div>"
+                        )
+                        # Append useful context below the objective (no "AC" labels)
+                        objective_html += (
+                            f"<br><div><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
+                            f"<b>Module:</b> {tc.get('application_module', '')}</div>"
+                            f"<div><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
+                            f"<b>Category:</b> {tc.get('test_category', '')}</div>"
+                        )
+
+                    # ── Preconditions HTML → goes into Custom.ObjectivesandPreconditions
+                    #    (the "Objectives and Preconditions" panel on the Test Case
+                    #    form in this project's process template).
+                    #    We render BOTH the Objective and the Preconditions in this
+                    #    field, since the field name is "Objectives and Preconditions".
+                    from xml.sax.saxutils import escape as _xml_escape
+                    raw_pre = (preconditions or '').strip()
+                    if not raw_pre:
+                        raw_pre = "User is logged in to EPP with the required permissions for this functionality."
+                    # Split into list items (newline first, then '; ' separator)
+                    if '\n' in raw_pre:
+                        items = [s.strip(' -•\t') for s in raw_pre.split('\n') if s.strip()]
+                    elif '; ' in raw_pre:
+                        items = [s.strip() for s in raw_pre.split('; ') if s.strip()]
+                    else:
+                        items = [raw_pre]
+                    if len(items) > 1:
+                        pre_html_block = "<ul>" + ''.join(
+                            f"<li>{_xml_escape(it)}</li>" for it in items) + "</ul>"
+                    else:
+                        pre_html_block = f"<div>{_xml_escape(items[0])}</div>"
+
+                    obj_html_block = ""
+                    if objective:
+                        obj_html_block = f"<div>{_xml_escape(objective)}</div>"
+
+                    preconditions_field_html = (
+                        (f"<p><b>Objective:</b></p>{obj_html_block}" if obj_html_block else "")
+                        + f"<p><b>Preconditions:</b></p>{pre_html_block}"
+                    )
+
+                    # Build a rich combined Description (legacy / fallback). No "AC" labels.
+                    desc_parts = []
+                    if objective:
+                        desc_parts.append(f"<p><b>Objective:</b><br>{objective}</p>")
+                    if preconditions:
+                        desc_parts.append(f"<p><b>Preconditions:</b><br>{preconditions.replace(chr(10), '<br>')}</p>")
+                    if overall_expected:
+                        desc_parts.append(f"<p><b>Overall Expected Result:</b><br>{overall_expected}</p>")
+                    desc_parts.append(f"<p><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
+                                      f"<b>Module:</b> {tc.get('application_module', '')}</p>")
+                    desc_parts.append(f"<p><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
+                                      f"<b>Category:</b> {tc.get('test_category', '')}</p>")
+                    desc_parts.append(f"<p><b>Review Status:</b> {tc.get('review_status', 'NO')} &mdash; "
+                                      f"<b>Automation State:</b> {tc.get('automation_state', 'Non-Automatable')}</p>")
+                    description_html = ''.join(desc_parts)
+
+                    # Custom fields (best-effort; will be dropped if process template lacks them)
+                    extra_fields = {
+                        'Custom.TestType': tc.get('test_type', ''),
+                        'Custom.TestCategory': tc.get('test_category', ''),
+                        'Custom.ReviewStatus': tc.get('review_status', 'NO'),
+                        'Custom.ApplicationName': tc.get('application_name', 'EPP'),
+                        'Custom.ApplicationModule': tc.get('application_module', ''),
+                    }
 
                     print(f"  Creating: {tc_title[:70]}...")
-                    result = create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, iteration_path)
+                    result = create_test_case_in_ado(
+                        tc_title=tc_title,
+                        steps_xml=steps_xml,
+                        preconditions_html=description_html,
+                        area_path=area_path,
+                        iteration_path=iteration_path,
+                        priority=tc.get('priority', 2),
+                        automation_status='Not Automated',
+                        extra_fields=extra_fields,
+                        objective_html=objective_html or None,
+                        preconditions_field_html=preconditions_field_html or None,
+                        description_html=description_html,
+                    )
                     if result:
                         tc_id = result['id']
                         link_test_case_to_story(tc_id, story_id)
@@ -1374,8 +1799,20 @@ def generate_and_push_test_cases(story_id):
                 self.wfile.write(json.dumps({'results': results}).encode())
 
                 created = [r for r in results if r['success']]
-                print(f"\n  Done: {len(created)}/{len(selected_indices)} test cases created in ADO.")
+                print(f"\n  Done: {len(created)}/{len(selected_tcs)} test cases created in ADO.")
                 server_result['done'] = True
+
+                # Auto-stop the server shortly after responding so the script exits
+                # cleanly once the user has pushed test cases to ADO.
+                def _shutdown_later():
+                    import time as _t
+                    _t.sleep(1.5)  # give the browser time to receive the response
+                    print("  Auto-stopping review server...")
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                threading.Thread(target=_shutdown_later, daemon=True).start()
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1390,11 +1827,11 @@ def generate_and_push_test_cases(story_id):
     port = 8765
     server = HTTPServer(('127.0.0.1', port), ReviewHandler)
 
-    print(f"\n  Review page: http://localhost:{port}/review")
+    print(f"\n  Review page: http://localhost:{port}/review?s={current_session_id[:8]}")
     print(f"  Opening in browser...")
     print(f"  (Select test cases, then click 'Add to ADO'. Press Ctrl+C to stop.)\n")
 
-    webbrowser.open(f"http://localhost:{port}/review")
+    webbrowser.open(f"http://localhost:{port}/review?s={current_session_id}")
 
     try:
         server.serve_forever()
@@ -1408,46 +1845,76 @@ def _build_review_html(ctx):
     """Build the review HTML page with checkboxes and the Add to ADO button."""
     tc_cards_html = ''
     for tc in ctx['test_cases']:
-        steps_html = ''.join(f'<li>{s}</li>' for s in tc['steps'])
-        priority = tc.get('priority', 'Medium')
-        test_type = tc.get('test_type', 'Functional')
+        steps = tc['steps']
+        expected_list = tc.get('expected') or []
+        if isinstance(expected_list, str):
+            expected_list = [expected_list]
+        # Render Steps + Expected as a 2-column table (per-step expected — RULE GEN 01.5)
+        rows = ''
+        for i, step in enumerate(steps):
+            exp = expected_list[i] if i < len(expected_list) else ''
+            rows += (
+                f'<tr><td style="width:40px;text-align:center;color:#888">{i+1}</td>'
+                f'<td>{step}</td>'
+                f'<td style="color:#1565c0">{exp or "&mdash;"}</td></tr>'
+            )
+        steps_table = (
+            '<table style="width:100%;border-collapse:collapse;font-size:.95em">'
+            '<thead><tr style="background:#f0e6ff;color:#764ba2">'
+            '<th style="padding:6px 8px;text-align:center;width:40px">#</th>'
+            '<th style="padding:6px 8px;text-align:left">Action</th>'
+            '<th style="padding:6px 8px;text-align:left">Expected Result</th>'
+            '</tr></thead><tbody>' + rows + '</tbody></table>'
+        )
+
+        priority = tc.get('priority', 2)
+        test_type = tc.get('test_type', 'Smoke & Regression')
+        test_category = tc.get('test_category', 'Functional')
         ac_ref = tc.get('ac_ref', '')
-        pri_color = {'High': '#e53935', 'Medium': '#fb8c00', 'Low': '#43a047'}.get(priority, '#888')
+        objective = tc.get('objective', '')
+        app_module = tc.get('application_module', '')
+        # Priority 1 = Highest (red)…4 = Lowest (green)
+        pri_color = {1: '#e53935', 2: '#fb8c00', 3: '#fdd835', 4: '#43a047'}.get(priority, '#888')
+        cat_color = {'API': '#1976d2', 'Functional': '#667eea', 'Negative': '#d32f2f'}.get(test_category, '#667eea')
+
         tc_cards_html += f'''
-        <div class="tc-card" data-index="{tc['index']}">
+        <div class="tc-card" data-index="{tc['index']}" data-uid="{tc['uid']}">
             <div class="tc-header">
                 <label class="tc-checkbox">
-                    <input type="checkbox" checked data-idx="{tc['index']}">
+                    <input type="checkbox" checked data-idx="{tc['index']}" data-uid="{tc['uid']}">
                     <span class="checkmark"></span>
                 </label>
                 <span class="tc-number">TC {tc['index']+1}</span>
                 <span class="tc-title">{tc['title']}</span>
-                <span style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-shrink:0">
-                    <span style="background:{pri_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.8em;font-weight:600">{priority}</span>
-                    <span style="background:#667eea;color:#fff;border-radius:8px;padding:2px 10px;font-size:.8em;font-weight:600">{test_type}</span>
-                    {"<span style='background:#f0e6ff;color:#764ba2;border-radius:8px;padding:2px 10px;font-size:.8em;font-weight:600'>" + ac_ref + "</span>" if ac_ref else ""}
+                <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
+                    <span style="background:{pri_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">P{priority}</span>
+                    <span style="background:#667eea;color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_type}</span>
+                    <span style="background:{cat_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_category}</span>
+                    {"<span style='background:#f0e6ff;color:#764ba2;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600'>" + ac_ref + "</span>" if ac_ref else ""}
                 </span>
             </div>
             <div class="tc-body">
+                <div class="tc-section">
+                    <div class="tc-label">Objective</div>
+                    <div class="tc-content">{objective if objective else '<span class="na">N/A</span>'}</div>
+                </div>
                 <div class="tc-section">
                     <div class="tc-label">Preconditions</div>
                     <div class="tc-content">{tc['preconditions'].replace(chr(10), '<br>') if tc['preconditions'] else '<span class="na">N/A</span>'}</div>
                 </div>
                 <div class="tc-section">
-                    <div class="tc-label">Test Steps</div>
-                    <div class="tc-content"><ul>{steps_html}</ul></div>
-                </div>
-                <div class="tc-section">
-                    <div class="tc-label">Expected Result</div>
-                    <div class="tc-content">{tc['expected'] if tc['expected'] else '<span class="na">N/A</span>'}</div>
+                    <div class="tc-label">Test Steps &amp; Expected Results</div>
+                    <div class="tc-content" style="padding:8px">{steps_table}</div>
                 </div>
                 <div class="tc-section">
                     <div class="tc-label">Overall Expected Result</div>
                     <div class="tc-content">{tc.get('overall_expected', '') if tc.get('overall_expected') else '<span class="na">N/A</span>'}</div>
                 </div>
-                <div class="tc-section">
-                    <div class="tc-label">Postconditions</div>
-                    <div class="tc-content">{tc['postconditions'] if tc['postconditions'] else '<span class="na">N/A</span>'}</div>
+                <div class="tc-section" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+                    <div><div class="tc-label">Application</div><div class="tc-content">{tc.get('application_name','EPP')}</div></div>
+                    <div><div class="tc-label">Module</div><div class="tc-content">{app_module or '<span class="na">N/A</span>'}</div></div>
+                    <div><div class="tc-label">Review Status</div><div class="tc-content">{tc.get('review_status','NO')}</div></div>
+                    <div><div class="tc-label">Automation State</div><div class="tc-content">{tc.get('automation_state','Non-Automatable')}</div></div>
                 </div>
             </div>
         </div>'''
@@ -1475,6 +1942,9 @@ def _build_review_html(ctx):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Review Test Cases - US #{ctx['story_id']}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1599,6 +2069,7 @@ updateCount();
 function addToADO(){{
     const boxes=document.querySelectorAll('.tc-card input[type=checkbox]:checked');
     const indices=Array.from(boxes).map(b=>parseInt(b.dataset.idx));
+    const uids=Array.from(boxes).map(b=>b.dataset.uid);
     if(indices.length===0)return;
 
     const btn=document.getElementById('addBtn');
@@ -1607,11 +2078,22 @@ function addToADO(){{
 
     fetch('/add-to-ado',{{
         method:'POST',
-        headers:{{'Content-Type':'application/json'}},
-        body:JSON.stringify({{indices:indices}})
+        headers:{{'Content-Type':'application/json','Cache-Control':'no-cache'}},
+        cache:'no-store',
+        body:JSON.stringify({{indices:indices,uids:uids,session_id:'{ctx['session_id']}'}})
     }})
-    .then(r=>r.json())
+    .then(r=>{{
+        if(r.status===409){{
+            return r.json().then(d=>{{
+                alert(d.message||'This review page is stale. Please reload (Ctrl+F5) and try again.');
+                location.reload(true);
+                return null;
+            }});
+        }}
+        return r.json();
+    }})
     .then(data=>{{
+        if(!data)return;
         spinner.style.display='none';btn.textContent='Add to ADO';btn.disabled=false;
         const overlay=document.getElementById('resultOverlay');
         const list=document.getElementById('resultList');
