@@ -5,10 +5,27 @@ import base64
 import urllib.parse
 from datetime import datetime
 import re
+from typing import Optional
 from fpdf import FPDF
 from io import BytesIO
 from jinja2 import Template
 import urllib3
+
+# Domain knowledge from EPP_Portal_Business_Documentation.md — used to make
+# generated test cases reflect the real Enterprise Payment Platform domain
+# (portals, screens, roles, routes, API endpoints).
+try:
+    from domain_context import build_domain_context  # when run from /test
+except ImportError:  # pragma: no cover  — when run from project root
+    from test.domain_context import build_domain_context
+
+# Historical-context lookup — finds and summarises prior User Stories /
+# Test Cases in the same Area Path so generation can match house style
+# and avoid duplicating existing coverage.
+try:
+    from history_context import build_history_context  # when run from /test
+except ImportError:  # pragma: no cover
+    from test.history_context import build_history_context
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -553,7 +570,7 @@ def get_work_item_full_details(work_item_id):
         print(f"Error fetching work item {work_item_id}: {e}")
         return None
 
-def generate_test_cases_from_acceptance_criteria(work_item):
+def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     """
     Rules-based test case generator. Strictly follows Rules.md.
     Returns (test_cases_list, ac_clean, desc_clean, title).
@@ -563,6 +580,12 @@ def generate_test_cases_from_acceptance_criteria(work_item):
       overall_expected, priority (1-4), test_type, test_category,
       review_status, automation_state, area_path, iteration_path,
       application_name, application_module, ac_ref
+
+    Optional ``history`` parameter: dict returned by
+    ``history_context.build_history_context`` — supplies prior-art
+    test case titles / keywords from neighbouring User Stories in the
+    same Area Path so the generator can suggest extra "neighbourhood"
+    coverage that the team has historically tested.
     """
     if not work_item:
         return [], '', '', ''
@@ -580,6 +603,12 @@ def generate_test_cases_from_acceptance_criteria(work_item):
 
     ac_blocks = _parse_ac_blocks(ac_clean)
 
+    # ── EPP DOMAIN CONTEXT ─────────────────────────────────────────────────
+    # Map this story to a concrete portal / screen / role using the business
+    # documentation. This lets us generate domain-aware test cases instead of
+    # generic "User does X" boilerplate.
+    domain = build_domain_context(title, desc_clean, ac_clean)
+
     # ── Detect story characteristics for conditional rule application ─────
     has_roles = any(kw in combined for kw in [
         'admin', 'role', 'permission', 'manager', 'approver', 'unauthorized', 'authoriz'
@@ -595,21 +624,36 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         'api', 'endpoint', 'webhook', 'service', 'request', 'response', 'http'
     ])
 
-    # Determine roles
-    role_keywords = {
-        'admin': 'Admin', 'administrator': 'Admin', 'manager': 'Manager',
-        'approver': 'Approver', 'reviewer': 'Reviewer', 'operator': 'Operator',
-        'editor': 'Editor', 'viewer': 'Viewer'
-    }
-    roles_found = []
-    for kw, label in role_keywords.items():
-        if kw in combined and label not in roles_found:
-            roles_found.append(label)
-    if not roles_found:
-        roles_found = ['User']
+    # ── Roles ──────────────────────────────────────────────────────────────
+    # Prefer roles identified from the EPP domain catalogue; fall back to
+    # generic keyword extraction only when nothing matched.
+    if domain.get('roles'):
+        roles_found = list(domain['roles'])
+        has_roles = True
+    else:
+        role_keywords = {
+            'admin': 'Admin', 'administrator': 'Admin', 'manager': 'Manager',
+            'approver': 'Approver', 'reviewer': 'Reviewer', 'operator': 'Operator',
+            'editor': 'Editor', 'viewer': 'Viewer'
+        }
+        roles_found = []
+        for kw, label in role_keywords.items():
+            if kw in combined and label not in roles_found:
+                roles_found.append(label)
+        if not roles_found:
+            roles_found = ['User']
 
-    # Detect best-fit Application Module from title/description
+    # Make sure the "primary" (action-driving) role is first in the list, so
+    # downstream code that uses roles_found[0] picks the most realistic actor.
+    primary_role = domain.get('primary_role')
+    if primary_role and primary_role in roles_found:
+        roles_found = [primary_role] + [r for r in roles_found if r != primary_role]
+
+    # Detect best-fit Application Module from title/description (fall back to
+    # the portal-resolved feature label when nothing else fits).
     module = _infer_application_module(combined)
+    if (not module or module == 'EPP General') and domain.get('feature'):
+        module = domain['feature']
 
     # Default category derivation
     default_category = 'API' if has_api else 'Functional'
@@ -623,6 +667,11 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         'iteration_path': iteration_path,
         'application_name': 'EPP',
         'application_module': module,
+        # EPP area tag (AP_Bulk / Resware_OB / Escrow_CEA / Escrow_IB /
+        # Escrow_OB / STEPS_OB / AP_WD / AP_Portal) — surfaced as an ADO
+        # tag at publish time. Empty string when the story doesn't match
+        # any defined area.
+        'epp_area': domain.get('epp_area') or '',
     }
 
     test_cases = []
@@ -642,7 +691,9 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         tc['expected'] = exps
         test_cases.append(tc)
 
-    feature_label = _short_feature(title)
+    # Prefer the EPP-domain feature label (e.g., "Payment Monitoring",
+    # "Bulk Payment Import") over a noisy substring of the story title.
+    feature_label = domain.get('feature') or _short_feature(title)
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE GEN 03: 1 test case per AC (the AC-coverage minimum)
@@ -663,16 +714,23 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         # ── Build steps & per-step expected — follow Rules.md sample format
         # (clear imperative actions, no "Ensure/Perform/Validate" prefixes).
         actor_label = roles_found[0] if has_roles else 'User'
+        portal_label = domain.get('portal') or 'EPP'
+        route_label = domain.get('route')
+
         steps = []
         exps = []
 
         # Step 1 — Login (always present, gives a concrete starting point)
-        steps.append(f"Log in to EPP as a {actor_label}")
-        exps.append(f"{actor_label} is successfully logged in")
+        steps.append(f"Log in to the {portal_label} as a {actor_label}")
+        exps.append(f"{actor_label} is signed in and lands on the role-based default page")
 
-        # Step 2 — Navigate to the feature
-        steps.append(f"Navigate to the {feature_label} screen / functionality")
-        exps.append(f"{feature_label} screen is displayed")
+        # Step 2 — Navigate to the feature (use the real route if we know it)
+        if route_label:
+            steps.append(f"Navigate to {feature_label} ({route_label})")
+            exps.append(f"The {feature_label} screen at {route_label} is displayed")
+        else:
+            steps.append(f"Navigate to the {feature_label} screen / functionality")
+            exps.append(f"{feature_label} screen is displayed")
 
         # Step 3 — Set up preconditions from GIVEN (only if non-trivial)
         if given_text and len(given_text) > 5:
@@ -693,15 +751,43 @@ def generate_test_cases_from_acceptance_criteria(work_item):
             steps.append("Verify the resulting behavior matches the objective of this test")
             exps.append("System behavior matches the objective stated in the test case")
 
+        # Step 6 (optional) — If the screen has known API hints, validate them
+        api_hints = domain.get('api_hints') or []
+        if api_hints and (has_api or 'api' in combined or 'endpoint' in combined):
+            steps.append("Verify the underlying API call and response")
+            exps.append(" / ".join(api_hints[:2]))
+
         # ── RULE GEN 02 — clean, business-friendly title per AC ──────────
         condition = _build_condition_phrase(then_text or when_text or ac_summary)
         actor = roles_found[0] if has_roles else 'system'
         ac_title = f"{feature_label} {condition}" if condition else feature_label
 
+        # ── Domain-aware preconditions: prefer the GIVEN clause from the
+        #    AC, but always layer in the portal/role/route context so the
+        #    tester can reproduce the exact starting state.
+        precond_lines: list = []
+        if domain.get('preconditions'):
+            precond_lines.extend(domain['preconditions'])
+        if given_text and given_text.strip():
+            precond_lines.append(given_text.strip())
+        if not precond_lines:
+            precond_lines.append(
+                f"{actor.capitalize()} is signed in to EPP with the appropriate role"
+            )
+        # Deduplicate while preserving order
+        seen_pc, dedup_pc = set(), []
+        for line in precond_lines:
+            key = line.lower()
+            if key not in seen_pc:
+                seen_pc.add(key)
+                dedup_pc.append(line)
+        preconditions_text = "\n".join(f"• {line}" for line in dedup_pc)
+
         add_tc({
             'title': ac_title,
-            'objective': f"Validate the requirement of '{title}': {ac_summary[:240]}",
-            'preconditions': given_text if given_text else f"{actor.capitalize()} is logged in to EPP with the appropriate role",
+            'objective': _build_objective(feature_label, given_text, when_text,
+                                          then_text, ac_summary, story_title=title),
+            'preconditions': preconditions_text,
             'steps': steps,
             'expected': exps,
             'overall_expected': then_text if then_text else "The requirement is fully satisfied",
@@ -716,20 +802,32 @@ def generate_test_cases_from_acceptance_criteria(work_item):
     # ══════════════════════════════════════════════════════════════════════
     if not any(tc['test_category'] == 'Functional' or tc['test_category'] == 'API' for tc in test_cases):
         actor = roles_found[0]
+        portal_label = domain.get('portal') or 'EPP'
+        route_label = domain.get('route')
+        nav_step = (f"Navigate to {feature_label} ({route_label})"
+                    if route_label else f"Navigate to the {feature_label} screen")
+        nav_exp = (f"The {feature_label} screen at {route_label} is displayed"
+                   if route_label else f"{feature_label} screen is displayed")
         add_tc({
             'title': f"{feature_label} works end-to-end with valid inputs",
-            'objective': f"Validate end-to-end happy path for '{title}'",
-            'preconditions': f"{actor} is logged in to EPP with the required permissions",
+            'objective': (f"Verify that the {feature_label} feature completes its primary "
+                          f"end-to-end flow successfully when an authorised {actor} provides "
+                          f"valid inputs."),
+            'preconditions': (
+                f"• User is signed in to the {portal_label} with the '{actor}' role\n"
+                + (f"• User can reach the route {route_label}\n" if route_label else "")
+                + "• All upstream services are available"
+            ),
             'steps': [
-                f"Log in to EPP as a {actor}",
-                f"Navigate to the {feature_label} screen",
+                f"Log in to the {portal_label} as a {actor}",
+                nav_step,
                 "Provide all required inputs with valid data",
                 "Trigger the primary action (e.g., Submit / Save / Send)",
                 "Observe the system response and confirmation feedback",
             ],
             'expected': [
-                f"{actor} is successfully logged in",
-                f"{feature_label} screen is displayed",
+                f"{actor} is signed in and lands on the role-based default page",
+                nav_exp,
                 "Inputs are accepted without validation errors",
                 "Action is processed successfully by the system",
                 "Success message / confirmation is displayed and data is persisted",
@@ -746,23 +844,37 @@ def generate_test_cases_from_acceptance_criteria(work_item):
     # ══════════════════════════════════════════════════════════════════════
     if not any(tc['test_category'] == 'Negative' for tc in test_cases):
         if has_roles:
+            portal_label = domain.get('portal') or 'EPP'
+            route_label = domain.get('route')
+            wrong_role = domain.get('negative_role') or 'a role outside the allowed list'
+            primary = domain.get('primary_role') or roles_found[0]
+            nav_step = (f"Attempt to navigate to {feature_label} ({route_label})"
+                        if route_label else f"Attempt to navigate to the {feature_label} screen")
             add_tc({
                 'title': f"Unauthorized user is blocked from {feature_label}",
-                'objective': "Validate that unauthorized roles cannot perform the action",
-                'preconditions': "A user account without the required permissions exists",
+                'objective': (f"Verify that a user with the '{wrong_role}' role (not in the allowed "
+                              f"list for {feature_label}) is prevented from accessing or performing "
+                              f"the action, and that no data is altered."),
+                'preconditions': (
+                    f"• A user account exists with ONLY the '{wrong_role}' role\n"
+                    f"• The {feature_label} screen is restricted to: {', '.join(roles_found)}"
+                ),
                 'steps': [
-                    "Log in to EPP as a user without the required role/permissions",
-                    f"Navigate to the {feature_label} screen (or attempt to invoke its API)",
-                    "Attempt to perform the primary action",
+                    f"Log in to the {portal_label} as a '{wrong_role}'",
+                    nav_step,
+                    "Attempt to perform the primary action (or call the underlying API directly)",
                     "Observe the system response",
                 ],
                 'expected': [
-                    "User is logged in",
-                    "Screen access is denied OR the action control is hidden/disabled",
-                    "System rejects the action attempt",
-                    "An appropriate access-denied error message is shown and no data changes occur",
+                    f"'{wrong_role}' is signed in but is redirected to access-denied or their default page",
+                    "Screen access is denied OR the action control is hidden / disabled",
+                    "API returns HTTP 401 / 403 and no state changes occur",
+                    "An appropriate access-denied message is shown to the user",
                 ],
-                'overall_expected': "Unauthorized users cannot use the feature and no data is modified",
+                'overall_expected': (
+                    f"Only users with one of [{', '.join(roles_found)}] can use {feature_label}; "
+                    f"'{wrong_role}' is blocked end-to-end."
+                ),
                 'priority': 1,
                 'test_type': 'Regression',
                 'test_category': 'Negative',
@@ -770,18 +882,21 @@ def generate_test_cases_from_acceptance_criteria(work_item):
             })
         else:
             actor = roles_found[0]
+            portal_label = domain.get('portal') or 'EPP'
             add_tc({
                 'title': f"System rejects invalid inputs for {feature_label}",
-                'objective': "Validate boundary and negative input behavior",
-                'preconditions': f"{actor} is logged in to EPP",
+                'objective': (f"Verify that the {feature_label} feature rejects invalid, "
+                              f"empty or out-of-range inputs gracefully and shows clear "
+                              f"validation messages without saving any data."),
+                'preconditions': f"{actor} is signed in to the {portal_label}",
                 'steps': [
-                    f"Log in to EPP as a {actor}",
+                    f"Log in to the {portal_label} as a {actor}",
                     f"Navigate to the {feature_label} screen",
                     "Submit invalid / out-of-range / empty inputs",
                     "Observe the validation behavior",
                 ],
                 'expected': [
-                    f"{actor} is successfully logged in",
+                    f"{actor} is successfully signed in",
                     f"{feature_label} screen is displayed",
                     "Submission is blocked",
                     "A clear, user-friendly error message is shown next to the offending field",
@@ -800,7 +915,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         for role in roles_found[:3]:
             add_tc({
                 'title': f"{role} can perform {feature_label} per role permissions",
-                'objective': f"Validate role-specific behavior for {role}",
+                'objective': f"Verify that the {feature_label} feature behaves correctly and applies the role-specific permissions defined for a {role}.",
                 'preconditions': f"A user account with the {role} role exists",
                 'steps': [
                     f"Log in to EPP as a {role}",
@@ -849,7 +964,7 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         for label, cat, prio, expected, action_step in data_variants:
             add_tc({
                 'title': f"{feature_label} submission with {label}",
-                'objective': f"Validate data-input handling for {label}",
+                'objective': f"Verify that the {feature_label} feature handles {label} correctly and produces the expected outcome without data corruption.",
                 'preconditions': (f"{actor} is logged in; the data entry form is accessible. "
                                   f"Test data source: CSV (header + valid + invalid + boundary rows + comment column)"),
                 'steps': [
@@ -880,7 +995,9 @@ def generate_test_cases_from_acceptance_criteria(work_item):
         actor = roles_found[0]
         add_tc({
             'title': f"UI elements render correctly on {feature_label} screen",
-            'objective': "Validate visibility, enable/disable state, mandatory fields and default values",
+            'objective': (f"Verify that all UI elements on the {feature_label} screen "
+                          f"render with the correct visibility, enable/disable state, "
+                          f"mandatory-field markers and default values per the design spec."),
             'preconditions': f"{actor} is logged in; the {feature_label} screen is accessible",
             'steps': [
                 f"Log in to EPP as a {actor}",
@@ -904,6 +1021,269 @@ def generate_test_cases_from_acceptance_criteria(work_item):
             'test_category': 'Functional',
             'ac_ref': 'UI',
         })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # EPP DOMAIN: Canonical workflow walkthrough (only if we matched a
+    # known screen and have explicit workflow steps for it).
+    # This adds genuine business-value coverage like "Retry a transmission-
+    # failed payment from /payments/monitoring" instead of a generic step.
+    # ══════════════════════════════════════════════════════════════════════
+    if domain.get('workflow_steps') and domain.get('confidence', 0) >= 0.4:
+        wf_actor = domain.get('primary_role') or roles_found[0]
+        wf_portal = domain.get('portal') or 'EPP'
+        wf_route = domain.get('route')
+        wf_steps = [f"Log in to the {wf_portal} as a {wf_actor}"] \
+                   + list(domain['workflow_steps'])
+        wf_exps = [f"{wf_actor} is signed in and lands on the role-based default page"] \
+                  + ["Step completes successfully" for _ in domain['workflow_steps']]
+        # Replace the last expected with the most meaningful outcome
+        if wf_exps:
+            wf_exps[-1] = "Workflow completes end-to-end and the business outcome is achieved"
+        api_hint = (" / ".join(domain['api_hints'][:2])
+                    if domain.get('api_hints') else "")
+        if api_hint:
+            wf_steps.append("Verify the underlying API call(s) and response status")
+            wf_exps.append(api_hint)
+
+        add_tc({
+            'title': f"{feature_label} canonical workflow as {wf_actor}",
+            'objective': (f"Verify the canonical end-to-end workflow for {feature_label} on "
+                          f"the {wf_portal}, performed by an authorised '{wf_actor}'."),
+            'preconditions': (
+                f"• User is signed in to the {wf_portal} with the '{wf_actor}' role\n"
+                + (f"• User can reach the route {wf_route}\n" if wf_route else "")
+                + "• All upstream services (Epp.Api, SharedServices.Api, providers) are healthy"
+            ),
+            'steps': wf_steps,
+            'expected': wf_exps,
+            'overall_expected': f"The {feature_label} workflow completes successfully end-to-end",
+            'priority': 1,
+            'test_type': 'Smoke & Regression',
+            'test_category': 'Functional',
+            'ac_ref': 'Workflow',
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # HISTORICAL CONTEXT (targeted enrichment, not addition)
+    # --------------------------------------------------------------------
+    # Use prior-art from neighbouring User Stories in the same Area Path
+    # to subtly ENRICH the test cases we already have — never to create
+    # new ones, and never as boilerplate added to every TC.
+    #
+    # Rules of engagement (kept tight on purpose):
+    #   • Only EPP-vocab keywords (history_context._DOMAIN_VOCAB) are
+    #     considered — generic words like "screen" never make it in.
+    #   • Each keyword must be relevant to the CURRENT story (matches
+    #     the title / description / AC / domain feature) OR sit on the
+    #     same theme as the test case (negative, data, workflow, …).
+    #   • At most ONE keyword is applied to each test case, and only
+    #     ONE surface area is touched (objective OR a precondition
+    #     bullet OR an extra step) — whichever fits best.
+    #   • A keyword is never reused across multiple TCs in the same
+    #     run, so each enrichment carries unique information.
+    # ══════════════════════════════════════════════════════════════════════
+    if history and history.get('neighbour_domain_keywords'):
+        # Build the current story's "fingerprint" (lower-cased blob of
+        # everything the generator already knows about it) so we can
+        # filter out historical keywords that are either trivially
+        # present already or have nothing to do with this story.
+        feature_lower = (feature_label or '').lower()
+        story_blob = " ".join([
+            title or '', desc_clean or '', ac_clean or '',
+            feature_lower,
+            domain.get('matched_screen', '') or '',
+            domain.get('route', '') or '',
+            " ".join(domain.get('keywords', []) or []),
+        ]).lower()
+
+        # 1) Take only domain-vocab keywords (already filtered upstream).
+        all_kws = [k for k in (history.get('neighbour_domain_keywords') or [])
+                   if len(k) >= 3]
+
+        # 2) Drop anything already obvious in this story's wording.
+        candidates = [k for k in all_kws
+                      if k.lower() not in feature_lower
+                      and k.lower() not in story_blob]
+
+        # 3) Rank by relevance: keywords that DO appear in the story
+        #    blob via a related form (e.g., "retries" vs "retry") get
+        #    boosted; the rest keep their natural order.
+        def _related_in_story(kw: str) -> bool:
+            stem = kw.rstrip('s')
+            return stem in story_blob or kw[:5] in story_blob
+
+        candidates.sort(key=lambda k: (0 if _related_in_story(k) else 1))
+
+        # Themes a keyword belongs to — used so we apply the RIGHT
+        # historical keyword to the RIGHT test case (e.g. a "retry"
+        # keyword belongs on a Workflow/Functional TC, not a UI one).
+        _THEME_MAP = {
+            'negative':  {'unauthorized', 'forbidden', 'denied', 'rejected', 'reject',
+                          'failed', 'invalid'},
+            'security':  {'role', 'roles', 'permission', 'permissions', 'rbac',
+                          'unauthorized', 'forbidden', 'denied',
+                          'fielduser', 'accountinguser', 'support',
+                          'administrator', 'ceafraudinvestigator',
+                          'accountverificationadministrator'},
+            'workflow':  {'retry', 'reverse', 'resolve', 'release', 'sync', 'post',
+                          'consolidate', 'consolidation', 'aggregate',
+                          'transmission', 'transmit', 'intent', 'intents',
+                          'monitoring', 'monitor', 'overnight', 'pending',
+                          'stuck', 'webhook', 'callback', 'integration',
+                          'integrations', 'resware', 'ewis', 'transactee'},
+            'data':      {'csv', 'import', 'bulk', 'amount', 'currency',
+                          'threshold', 'thresholds', 'preference',
+                          'preferences', 'etag', 'audit', 'log', 'event',
+                          'events'},
+            'banking':   {'bank', 'banks', 'iba', 'rails', 'ach', 'wire',
+                          'rtp', 'sameday', 'samedayach', 'account',
+                          'accounts', 'reveal'},
+            'onboarding': {'counterparty', 'counterparties', 'onboard',
+                           'onboarding', 'verification', 'ews', 'pnc'},
+        }
+
+        def _themes_for_kw(kw: str) -> set:
+            kl = kw.lower()
+            return {t for t, words in _THEME_MAP.items() if kl in words}
+
+        def _themes_for_tc(tc: dict) -> set:
+            themes = set()
+            cat = (tc.get('test_category') or '').lower()
+            ac_ref = (tc.get('ac_ref') or '').lower()
+            if cat == 'negative':
+                themes.add('negative')
+            if cat == 'api' or 'workflow' in ac_ref:
+                themes.add('workflow')
+            if ac_ref.startswith('role:') or ac_ref == 'security':
+                themes.add('security')
+            if ac_ref.startswith('data:'):
+                themes.add('data')
+            if ac_ref == 'ui':
+                themes.add('ui')   # nothing in the vocab matches UI — by design
+            if not themes:
+                themes.add('workflow')  # default for AC / Happy-Path TCs
+            return themes
+
+        def _pick_keyword_for(tc: dict, used: set) -> Optional[str]:
+            tc_themes = _themes_for_tc(tc)
+            # First pass: theme match
+            for k in candidates:
+                if k in used:
+                    continue
+                if _themes_for_kw(k) & tc_themes:
+                    return k
+            # Second pass: any remaining keyword (skip if TC is UI-only)
+            if 'ui' in tc_themes and len(tc_themes) == 1:
+                return None
+            for k in candidates:
+                if k in used:
+                    continue
+                return k
+            return None
+
+        used_keywords: set = set()
+        neighbour_ids_sample = [
+            str(n.get('id'))
+            for n in (history.get('neighbour_stories') or [])[:3]
+            if n.get('id')
+        ]
+
+        def _join_sentence(base: str, addendum: str) -> str:
+            """Append ``addendum`` to ``base`` with a clean sentence break."""
+            b = (base or '').rstrip()
+            if not b:
+                return addendum
+            if b[-1] not in '.!?':
+                b += '.'
+            return f"{b} {addendum.lstrip()}"
+
+        for tc in test_cases:
+            if not candidates:
+                break
+            kw = _pick_keyword_for(tc, used_keywords)
+            if not kw:
+                continue
+            used_keywords.add(kw)
+            kw_disp = kw.capitalize()
+
+            # Decide which single surface area to touch for this TC.
+            ac_ref = (tc.get('ac_ref') or '').lower()
+            cat = (tc.get('test_category') or '').lower()
+
+            if ac_ref.startswith('ac'):
+                # AC-driven TC → enrich its Objective with a domain hook
+                obj = tc.get('objective', '') or ''
+                if kw.lower() not in obj.lower() and obj:
+                    tc['objective'] = _join_sentence(
+                        obj,
+                        f"Also exercises the '{kw_disp}' flow "
+                        f"previously covered in this area."
+                    )
+            elif cat == 'negative' or ac_ref == 'security':
+                # Negative / security TC → add a sharp precondition bullet
+                bullet = (f"• Historical baseline: prior stories in this area "
+                          f"have hardened '{kw_disp}' handling — the same "
+                          f"safeguards must hold here.")
+                existing = tc.get('preconditions', '') or ''
+                if 'Historical baseline' not in existing:
+                    tc['preconditions'] = (
+                        existing.rstrip() + "\n" + bullet
+                        if existing else bullet
+                    )
+            elif ac_ref == 'workflow' or cat == 'api':
+                # Workflow / API TC → tack on a quick regression-anchor step
+                extra_step = (f"Smoke-check the '{kw_disp}' regression path "
+                              f"that neighbouring stories rely on")
+                extra_exp = (f"Existing '{kw_disp}' behaviour is unchanged "
+                             f"by this story")
+                steps = tc.get('steps') or []
+                exps = tc.get('expected') or []
+                if extra_step not in steps:
+                    steps.append(extra_step)
+                    exps.append(extra_exp)
+                    tc['steps'] = steps
+                    tc['expected'] = exps
+            elif ac_ref.startswith('data:'):
+                # Data-driven TC → mention the historical data shape
+                obj = tc.get('objective', '') or ''
+                if kw.lower() not in obj.lower() and obj:
+                    tc['objective'] = _join_sentence(
+                        obj,
+                        f"Data shapes should remain compatible with the "
+                        f"'{kw_disp}' coverage already in place."
+                    )
+            else:
+                # Happy-Path / Role / generic → light objective touch
+                obj = tc.get('objective', '') or ''
+                if kw.lower() not in obj.lower() and obj:
+                    tc['objective'] = _join_sentence(
+                        obj,
+                        f"Keeps parity with the '{kw_disp}' baseline "
+                        f"established by recent stories in this area."
+                    )
+
+        # Stash the enrichment summary on the FIRST TC only, as a
+        # single audit-trail bullet — replaces the old per-TC boilerplate.
+        if used_keywords and test_cases:
+            anchor = test_cases[0]
+            audit_bits = []
+            if used_keywords:
+                audit_bits.append(
+                    "Historical enrichment applied: "
+                    + ", ".join(sorted(k.capitalize() for k in used_keywords))
+                )
+            if neighbour_ids_sample:
+                audit_bits.append(
+                    "Reference prior stories: "
+                    + ", ".join(f"#{i}" for i in neighbour_ids_sample)
+                )
+            audit_line = "• " + " — ".join(audit_bits)
+            existing = anchor.get('preconditions', '') or ''
+            if 'Historical enrichment applied' not in existing:
+                anchor['preconditions'] = (
+                    existing.rstrip() + "\n" + audit_line
+                    if existing else audit_line
+                )
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE GEN 04 + RULE MAINT 12: Club / dedupe similar-outcome test cases
@@ -975,31 +1355,101 @@ def _clean_clause(text):
 
 
 def _build_condition_phrase(text):
-    """Turn a free-form GWT clause into a short, business-readable
-    'condition / business rule' phrase suitable for a test case title.
-    Returns at most ~70 chars, stripped of dashes, AC labels and filler.
+    """Turn a free-form GWT clause into a SHORT, business-readable
+    phrase suitable for a test case title (e.g. "displays bank filter",
+    "rejects invalid amount"). Returns at most ~45 chars.
     """
     t = _clean_clause(text)
     if not t:
         return ''
-    # Drop common AC noise
+    # Drop common AC noise & filler
     t = re.sub(r'\bAC\s*\d+\b[:\-]?\s*', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(the\s+)?(system|user|application)\s+(should|will|must|shall)\s+', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(verify|validate|ensure|check)\s+', '', t, flags=re.IGNORECASE)
-    # Take first meaningful sentence/clause only
-    t = re.split(r'[.;]\s+', t)[0]
-    t = re.sub(r'\s+', ' ', t).strip()
-    # Limit length, cut at last word boundary
-    if len(t) > 70:
-        cut = t[:70].rsplit(' ', 1)[0]
-        t = cut
+    t = re.sub(r'^(given|when|then|and|but)\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(the\s+)?(system|user|application|page|screen)\s+(should|will|must|shall)\s+',
+               '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+(be\s+)?', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(verify|validate|ensure|check|confirm)\s+(that\s+)?', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(a|an|the)\s+', '', t, flags=re.IGNORECASE)
+    # Cut at first sentence/clause boundary OR at a comma if line is long
+    t = re.split(r'[.;:]\s+', t)[0]
+    if len(t) > 45 and ',' in t:
+        t = t.split(',', 1)[0]
+    t = re.sub(r'\s+', ' ', t).strip().rstrip(',;:- ')
+    # Hard cap ~45 chars at last word boundary
+    if len(t) > 45:
+        cut = t[:45].rsplit(' ', 1)[0]
+        t = cut.rstrip(',;:- ')
     return t
+
+
+def _build_objective(feature_label, given_text, when_text, then_text, ac_summary, story_title=''):
+    """Synthesise a concise 1-2 line Objective for a test case from the
+    parsed Given/When/Then of an Acceptance Criterion.
+
+    Goal: state WHAT the test verifies and WHY it matters — without copy-
+    pasting the entire AC. Output is plain English, max ~220 chars,
+    starts with "Verify that ..." or "Confirm that ...".
+    """
+    def _norm(s):
+        if not s:
+            return ''
+        s = _clean_clause(s)
+        s = re.sub(r'\bAC\s*\d+\b[:\-]?\s*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'^(given|when|then|and|but)\s+', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'^(the\s+)?(system|user|application)\s+(should|will|must|shall)\s+',
+                   r'\1\2 ', s, flags=re.IGNORECASE)
+        s = re.sub(r'\s+', ' ', s).strip().rstrip('.;,:-')
+        # First sentence only
+        s = re.split(r'(?<=[.!?])\s+', s)[0]
+        return s
+
+    when_n = _norm(when_text)
+    then_n = _norm(then_text)
+    given_n = _norm(given_text)
+
+    # Trim each piece so the final sentence stays readable
+    def _trim(s, n):
+        if not s or len(s) <= n:
+            return s
+        cut = s[:n].rsplit(' ', 1)[0]
+        return cut.rstrip(',;:- ')
+
+    when_n = _trim(when_n, 110)
+    then_n = _trim(then_n, 110)
+    given_n = _trim(given_n, 80)
+
+    # Prefer: "Verify that <when_action> <then_outcome>."
+    if when_n and then_n:
+        objective = f"Verify that when {when_n}, {then_n}."
+    elif then_n:
+        objective = f"Verify that {then_n} for {feature_label}."
+    elif when_n:
+        objective = f"Verify the behaviour of {feature_label} when {when_n}."
+    else:
+        # Last-resort fallback: a one-line summary of the AC, NOT the whole text
+        summary = _trim(_norm(ac_summary), 160)
+        if summary:
+            objective = f"Verify that {feature_label} satisfies the requirement: {summary}."
+        else:
+            objective = f"Verify that {feature_label} behaves as defined by the acceptance criteria."
+
+    # Optionally add a brief context clause from GIVEN if it adds value
+    if given_n and given_n.lower() not in objective.lower() and len(objective) < 170:
+        objective += f" (Context: {given_n}.)"
+
+    # Final tidy-up
+    objective = re.sub(r'\s+', ' ', objective)
+    objective = re.sub(r'\bthat that\b', 'that', objective, flags=re.IGNORECASE)
+    objective = re.sub(r'\bwhen when\b', 'when', objective, flags=re.IGNORECASE)
+    # Hard cap at ~280 chars (≈ 1-2 lines)
+    if len(objective) > 280:
+        objective = objective[:280].rsplit(' ', 1)[0].rstrip(',;:- ') + '.'
+    return objective.strip()
 
 
 def _normalize_title(t):
     """RULE GEN 02 — start with 'Verify', no 'that', collapse whitespace,
-    no trailing punctuation, max 120 chars."""
+    no trailing punctuation, max 90 chars (precise & to-the-point)."""
     t = re.sub(r'\s+', ' ', t or '').strip()
     t = re.sub(r'\bthat\b\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[\-\u2013\u2014\s]+', '', t)
@@ -1007,8 +1457,8 @@ def _normalize_title(t):
     if not t.lower().startswith('verify'):
         t = 'Verify ' + t
     t = re.sub(r'\s+', ' ', t).strip()
-    if len(t) > 120:
-        cut = t[:120].rsplit(' ', 1)[0]
+    if len(t) > 90:
+        cut = t[:90].rsplit(' ', 1)[0]
         t = cut
     return t
 
@@ -1380,14 +1830,17 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
         priority = priority_map.get(priority, 2)
 
-    # Build the tag list. Always include "Gen-AI" plus the test_type and
-    # test_category (from extra_fields) so they are visible in ADO even when
-    # the project's process template lacks Custom.TestType / Custom.TestCategory.
+    # Build the tag list. Always include "Gen-AI" and the mandatory
+    # "AI TestCase" tag, plus the test_type and test_category (from
+    # extra_fields) and any EPP area tag (AP_Bulk / Resware_OB / etc.).
+    # These are surfaced via System.Tags so they remain visible in ADO
+    # even when the project's process template lacks the Custom.* fields.
     # Tags in ADO are semicolon-separated.
-    tag_parts = ["Gen-AI"]
+    tag_parts = ["Gen-AI", "AI TestCase"]
     if extra_fields:
         tt = (extra_fields.get('Custom.TestType') or '').strip()
         tc_cat = (extra_fields.get('Custom.TestCategory') or '').strip()
+        epp_area = (extra_fields.get('X-Tag.EppArea') or '').strip()
         # "Smoke & Regression" -> two separate tags so both are filterable in ADO
         if tt:
             for piece in re.split(r'\s*&\s*|\s*,\s*|\s*/\s*', tt):
@@ -1396,6 +1849,8 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
                     tag_parts.append(piece)
         if tc_cat and tc_cat not in tag_parts:
             tag_parts.append(tc_cat)
+        if epp_area and epp_area not in tag_parts:
+            tag_parts.append(epp_area)
     tags_value = "; ".join(tag_parts)
 
     patch_doc = [
@@ -1434,6 +1889,10 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         for ref_name, value in extra_fields.items():
             if value is None or value == '':
                 continue
+            # Virtual "X-Tag.*" entries are folded into System.Tags above
+            # and must NOT be sent as real ADO field operations.
+            if ref_name.startswith('X-Tag.'):
+                continue
             patch_doc.append({"op": "add", "path": f"/fields/{ref_name}", "value": value})
 
     patch_headers = {
@@ -1452,23 +1911,32 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         resp = requests.post(url, headers=patch_headers, json=patch_doc, verify=False, timeout=30)
         if resp.status_code >= 400:
             err_text = resp.text or ''
-            # Build set of "optional" field reference names that we should drop on retry:
-            # - any extra_fields
-            # - the "objectives & preconditions" custom field, in case template differs
-            optional_refs = set()
-            if extra_fields:
-                optional_refs.update(extra_fields.keys())
-            optional_refs.add('Custom.ObjectivesandPreconditions')
-            optional_refs.add('Microsoft.VSTS.TCM.Preconditions')
 
             # Detect any specific TF51535 "Cannot find field X" error and drop X.
-            # Use a non-greedy capture that stops at whitespace, dot+space, or quote
-            # so we don't accidentally swallow the trailing sentence period.
+            # Use a non-greedy capture that stops at the trailing sentence
+            # period (don't swallow it into the field name).
             missing = re.findall(r"Cannot find field ([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)", err_text)
-            for m in missing:
-                optional_refs.add(m)
-                # Remember it for future calls in this run.
-                _KNOWN_MISSING_FIELDS.add(m)
+
+            # Build the drop-set. PREFER the specifically-named missing
+            # fields from the error — that way we only strip what ADO
+            # actually objected to. Only fall back to the broad "drop
+            # every custom/optional field" sweep when we can't parse a
+            # specific field name from the error (very rare).
+            optional_refs = set()
+            if missing:
+                for m in missing:
+                    optional_refs.add(m)
+                    # Remember it for future calls in this run.
+                    _KNOWN_MISSING_FIELDS.add(m)
+            else:
+                # Generic fallback — couldn't isolate the offending field,
+                # so retry without any "best-effort" custom fields.
+                if extra_fields:
+                    optional_refs.update(
+                        k for k in extra_fields.keys() if not k.startswith('X-Tag.')
+                    )
+                optional_refs.add('Custom.ObjectivesandPreconditions')
+                optional_refs.add('Microsoft.VSTS.TCM.Preconditions')
 
             print(f"  Retry without optional fields (ADO error: {err_text[:160]})")
             core_doc = [p for p in patch_doc if not any(
@@ -1556,8 +2024,37 @@ def generate_and_push_test_cases(story_id):
     print(f"  Assigned: {assignee}")
     print(f"  AC found: {'Yes' if ac_raw else 'No'}")
 
-    # 2. Generate test cases
-    test_cases_raw, ac_clean, desc_clean, _ = generate_test_cases_from_acceptance_criteria(work_item)
+    # 1.5 Build a historical context from neighbouring User Stories /
+    #     Test Cases in the same Area Path. Best-effort: any failure
+    #     here is non-fatal and just means we proceed without prior-art.
+    history_ctx = None
+    try:
+        # Pre-classify the story so we can narrow the WIQL by EPP area-tag
+        pre_domain = build_domain_context(
+            title, clean_html(description) if description else '',
+            clean_html(ac_raw) if ac_raw else '')
+        epp_area_tag = pre_domain.get('epp_area')
+        print(f"  Looking up neighbouring User Stories in area: {area_path}"
+              + (f" (tag: {epp_area_tag})" if epp_area_tag else ""))
+        history_ctx = build_history_context(
+            current_story_id=int(story_id),
+            current_area_path=area_path,
+            ado_org=ADO_ORG,
+            ado_project=ADO_PROJECT,
+            headers=headers,
+            epp_area=epp_area_tag,
+        )
+        if history_ctx and history_ctx.get('neighbour_stories'):
+            print(f"  History: {history_ctx['summary']}")
+        else:
+            print("  History: no comparable prior User Stories found")
+    except Exception as e:
+        print(f"  History: lookup skipped ({e})")
+        history_ctx = None
+
+    # 2. Generate test cases (history is used as supplemental context)
+    test_cases_raw, ac_clean, desc_clean, _ = \
+        generate_test_cases_from_acceptance_criteria(work_item, history=history_ctx)
     if not test_cases_raw:
         print("WARNING: No test cases could be generated.")
         return
@@ -1592,6 +2089,7 @@ def generate_and_push_test_cases(story_id):
             'application_name': tc.get('application_name', 'EPP'),
             'application_module': tc.get('application_module', ''),
             'ac_ref': tc.get('ac_ref', ''),
+            'epp_area': tc.get('epp_area', ''),
         })
 
     story_context = {
@@ -1605,6 +2103,10 @@ def generate_and_push_test_cases(story_id):
         'description': desc_clean,
         'acceptance_criteria': ac_clean,
         'test_cases': tc_data_list,
+        # Surface the historical context so the review page can show
+        # which neighbouring stories / domain keywords shaped the
+        # generated test cases (RULE HIST 15).
+        'history': history_ctx or {},
     }
 
     # ── Build Review HTML ──────────────────────────────────────────────────
@@ -1723,23 +2225,15 @@ def generate_and_push_test_cases(story_id):
                     tc_steps = [_scrub_ac(s) for s in (tc.get('steps') or [])]
                     tc_expected = [_scrub_ac(e) for e in (tc.get('expected') or [])]
 
-                    # ── Build Steps so Objective + Preconditions are visible on the
-                    #    main Steps tab in ADO (most reliable place users see them).
-                    full_steps = []
-                    full_expected = []
-                    if objective:
-                        full_steps.append(f"<b>Objective:</b> {objective}")
-                        full_expected.append("Objective is understood by the tester")
-                    if preconditions:
-                        pre_html = preconditions.replace(chr(10), '<br>')
-                        full_steps.append(f"<b>Preconditions:</b><br>{pre_html}")
-                        full_expected.append("All preconditions are satisfied before execution begins")
-
-                    full_steps.extend(tc_steps)
-                    full_expected.extend(tc_expected or [])
+                    # ── Build Steps tab content. Objective and Preconditions are
+                    #    shown ONLY in their dedicated ADO fields (System.Description
+                    #    / Custom.ObjectivesandPreconditions) — NOT in the Steps tab,
+                    #    to avoid duplication.
+                    full_steps = list(tc_steps)
+                    full_expected = list(tc_expected or [])
 
                     if overall_expected:
-                        full_steps.append("<b>Overall Expected Result</b>")
+                        full_steps.append("Verify the overall expected outcome of the test case")
                         full_expected.append(overall_expected)
 
                     steps_xml = format_steps_as_ado_xml(full_steps, full_expected)
@@ -1813,6 +2307,9 @@ def generate_and_push_test_cases(story_id):
                         'Custom.ReviewStatus': tc.get('review_status', 'NO'),
                         'Custom.ApplicationName': tc.get('application_name', 'EPP'),
                         'Custom.ApplicationModule': tc.get('application_module', ''),
+                        # EPP area tag (AP_Bulk / Resware_OB / Escrow_CEA / etc.)
+                        # — surfaced into System.Tags by create_test_case_in_ado.
+                        'X-Tag.EppArea': tc.get('epp_area', '') or '',
                     }
 
                     print(f"  Creating: {tc_title[:70]}...")
@@ -1918,9 +2415,21 @@ def _build_review_html(ctx):
         ac_ref = tc.get('ac_ref', '')
         objective = tc.get('objective', '')
         app_module = tc.get('application_module', '')
+        epp_area = tc.get('epp_area', '')
         # Priority 1 = Highest (red)…4 = Lowest (green)
         pri_color = {1: '#e53935', 2: '#fb8c00', 3: '#fdd835', 4: '#43a047'}.get(priority, '#888')
         cat_color = {'API': '#1976d2', 'Functional': '#667eea', 'Negative': '#d32f2f'}.get(test_category, '#667eea')
+        # EPP area badge colours — each domain area gets its own colour for fast visual filtering
+        area_color = {
+            'AP_Bulk':    '#00897b',  # teal
+            'AP_WD':      '#5e35b1',  # purple
+            'AP_Portal':  '#3949ab',  # indigo
+            'STEPS_OB':   '#d81b60',  # pink
+            'Resware_OB': '#c62828',  # red
+            'Escrow_OB':  '#ef6c00',  # orange
+            'Escrow_IB':  '#2e7d32',  # green
+            'Escrow_CEA': '#1565c0',  # blue
+        }.get(epp_area, '#616161')
 
         tc_cards_html += f'''
         <div class="tc-card" data-index="{tc['index']}" data-uid="{tc['uid']}">
@@ -1935,6 +2444,7 @@ def _build_review_html(ctx):
                     <span style="background:{pri_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">P{priority}</span>
                     <span style="background:#667eea;color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_type}</span>
                     <span style="background:{cat_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_category}</span>
+                    {"<span style='background:" + area_color + ";color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:700;letter-spacing:.3px'>" + epp_area + "</span>" if epp_area else ""}
                     {"<span style='background:#f0e6ff;color:#764ba2;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600'>" + ac_ref + "</span>" if ac_ref else ""}
                 </span>
             </div>
@@ -1981,6 +2491,49 @@ def _build_review_html(ctx):
             ac_blocks.append(current.strip())
         for i, ac in enumerate(ac_blocks, 1):
             ac_items_html += f'<div class="ac-item"><span class="ac-num">{i}</span>{ac}</div>'
+
+    # ── Historical context panel (RULE HIST 15) ──────────────────────────
+    # Renders ONCE at the top of the page so testers can see which
+    # neighbouring User Stories and EPP domain keywords influenced the
+    # generated test cases — instead of repeating that info on every TC.
+    history = ctx.get('history') or {}
+    history_panel_html = ''
+    h_neighbours = history.get('neighbour_stories') or []
+    h_kws = history.get('neighbour_domain_keywords') or []
+    if h_neighbours or h_kws:
+        kw_chips = ''.join(
+            f'<span class="hk-chip">{k.capitalize()}</span>'
+            for k in h_kws[:12]
+        )
+        neighbour_rows = ''
+        for n in h_neighbours[:6]:
+            nid = n.get('id')
+            ntitle = (n.get('title') or '').replace('<', '&lt;').replace('>', '&gt;')
+            nstate = n.get('state') or ''
+            ntags = (n.get('tags') or '').replace(';', ' · ')
+            if not nid:
+                continue
+            neighbour_rows += (
+                f'<div class="hn-row">'
+                f'<span class="hn-id">#{nid}</span>'
+                f'<span class="hn-title">{ntitle}</span>'
+                f'<span class="hn-state">{nstate}</span>'
+                f'<span class="hn-tags">{ntags}</span>'
+                f'</div>'
+            )
+        summary_text = history.get('summary') or ''
+        history_panel_html = (
+            '<div class="info-panel history-panel">'
+            '<h2>Historical Context Used</h2>'
+            '<p class="hp-sub">Prior-art from neighbouring User Stories in the same Area Path '
+            'was used to <strong>enrich</strong> (not duplicate) the test cases below.</p>'
+            + (f'<div class="hp-summary">{summary_text}</div>' if summary_text else '')
+            + (f'<div class="hp-section-label">Domain keywords inherited</div>'
+               f'<div class="hk-list">{kw_chips}</div>' if kw_chips else '')
+            + (f'<div class="hp-section-label">Neighbouring User Stories</div>'
+               f'<div class="hn-list">{neighbour_rows}</div>' if neighbour_rows else '')
+            + '</div>'
+        )
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -2048,6 +2601,21 @@ body{{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height
 
 .spinner{{display:none;width:24px;height:24px;border:3px solid #ccc;border-top-color:#2e7d32;border-radius:50%;animation:spin .8s linear infinite;margin-left:12px}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
+
+/* ── Historical context panel (RULE HIST 15) ───────────────────────── */
+.history-panel{{border-left:4px solid #764ba2;background:linear-gradient(180deg,#fff,#faf7ff)}}
+.history-panel h2{{color:#764ba2}}
+.hp-sub{{color:#555;font-size:.92em;margin-bottom:10px}}
+.hp-summary{{display:inline-block;background:#f0e6ff;color:#4527a0;border-radius:8px;padding:4px 12px;font-size:.85em;font-weight:600;margin-bottom:12px}}
+.hp-section-label{{font-weight:600;color:#764ba2;font-size:.9em;margin:14px 0 6px}}
+.hk-list{{display:flex;flex-wrap:wrap;gap:6px}}
+.hk-chip{{background:#fff;color:#4527a0;border:1px solid #d1c4e9;border-radius:14px;padding:3px 10px;font-size:.82em;font-weight:600}}
+.hn-list{{display:flex;flex-direction:column;gap:6px}}
+.hn-row{{display:grid;grid-template-columns:70px 1fr auto auto;gap:10px;align-items:center;background:#fff;border:1px solid #ede7f6;border-radius:8px;padding:6px 12px;font-size:.9em}}
+.hn-id{{color:#764ba2;font-weight:700}}
+.hn-title{{color:#222;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.hn-state{{background:#e8f5e9;color:#2e7d32;border-radius:6px;padding:2px 8px;font-size:.78em;font-weight:600}}
+.hn-tags{{color:#999;font-size:.78em}}
 </style>
 </head>
 <body>
@@ -2065,6 +2633,8 @@ body{{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height
         <div class="info-row"><span class="lbl">Assigned To:</span><span class="val">{ctx['assignee']}</span></div>
         {f'<div class="info-row"><span class="lbl">Description:</span><span class="val">{ctx["description"][:300]}</span></div>' if ctx['description'] else ''}
     </div>
+
+    {history_panel_html}
 
     {f'<div class="info-panel"><h2>Acceptance Criteria</h2>{ac_items_html}</div>' if ac_items_html else ''}
 
