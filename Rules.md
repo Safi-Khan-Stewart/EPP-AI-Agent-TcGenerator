@@ -165,6 +165,25 @@ AI must:
 
 ---
 
+### RULE SCOPE 16: Story-Scoped Generation (Source of Truth = the Story)
+The User Story's **Title + Description + Business Context + Acceptance Criteria** are the **only** source of scope. The domain catalogue (`domain_context.py`) and historical context (`history_context.py`) may supply *labels, routes, API hints and vocabulary* — they **must never** introduce extra roles, screens, data flows, or workflows that the story itself does not mention.
+
+Before applying any RULE COV / RULE FUNC / RULE DATA expansion the generator MUST compute a **story scope** via `_extract_story_scope(title, description, acceptance_criteria, domain)` and obey it:
+
+1. **Named roles win.** If the story explicitly names role(s) — e.g. *"As an Accounting User …"* — only those role(s) are used. The catalogue's broader role list is **not** appended.
+2. **RULE COV 07 (multi-role)** only fires when the story names **more than one** distinct role (`scope.allow_multi_role == True`). A single-actor story produces **no** extra per-role TCs.
+3. **RULE COV 08 + RULE DATA 09 (data variants)** only fire when the story actually talks about data entry / forms / inputs / upload / CSV (`scope.allow_data == True`). Display-only or filter-only stories produce **no** data-variant TCs.
+4. **RULE FUNC 10 (UI rendering)** only fires when the story raises UI-rendering concerns AND the story has **not** marked UI / layout / redesign as out-of-scope (`scope.allow_ui == True`).
+5. **Canonical workflow walkthrough** only fires when the story genuinely asks for an end-to-end flow AND the story does not mark workflow / payment-execution as out-of-scope (`scope.allow_workflow == True`). Narrow display / filter / aggregation rules (e.g. *"Exclude Rejected from Failed tab"*) get **no** workflow TC.
+6. **Negative / Unauthorized TC** is only added when the story raises an auth / permission concern (`scope.allow_security == True`). For narrow display / filter stories the Acceptance Criterion is itself the negative case, so no extra TC is needed.
+7. **Out-of-Scope honoured.** Any item parsed from the story's "Out of Scope" / "Not in Scope" section automatically suppresses the corresponding expansion (UI redesign → no UI TC; payment execution → no workflow TC; new tabs / statuses → no extra tab TCs; etc.).
+
+✅ **Net effect:** for a narrow story like *"Exclude Rejected Transactions from Failed Tab"* (US #451104 — single Accounting User actor, single AC, "UI redesign" + "new monitoring tabs" + "payment execution" all out-of-scope), the generator produces **only** the AC-driven test case(s) plus, at most, a Happy-Path TC for the same actor — never extra role / data / UI / workflow / negative coverage.
+
+✅ **Implementation reference:** `test/ado_advisor.py → _extract_story_scope()` and the scope-gated expansion blocks inside `generate_test_cases_from_acceptance_criteria()`.
+
+---
+
 ### RULE HIST 15: Historical Context Awareness
 Before generating test cases for a new User Story, the AI must:
 
@@ -220,9 +239,9 @@ Pick exactly **one** tag based on the User Story's portal and feature area. Rule
 | 3 | `AP_Bulk`   | **Admin Portal Bulk Payments** (import, pending approvals, approved, rejected, approval history) |
 | 4 | `AP_Portal` | **Admin Portal UI changes** — edit vendor profile, party user, party info display, vendor screens |
 | 5 | `Escrow_IB` | **Escrow Inbound payments** — EMD via "New Payment Request" button or the public EMD form |
-| 6 | `Escrow_OB` | **Escrow Outbound payments UI changes** — UI/UX work on outbound payment screens (ACH OB / Legacy TPS Wire / Intercompany / Consolidated / Overnight) |
-| 7 | `Resware_OB`| **Escrow Outbound payments** (non-UI) — backend/workflow work on the same outbound family above |
-| 8 | `Escrow_CEA`| **Escrow Dashboard main-screen enhancements** — Banks, Bank Accounts, Counterparty, Monitoring, History, My Payments, Profile (and any Escrow story that doesn't match a more specific rule) |
+| 6 | `Escrow_OB` | **Escrow Outbound payments UI changes** — UI/UX work on outbound payment screens, including the **Payments Monitoring dashboard** (Failed / Transmission Failed / Consolidation / Rejected tabs), grids, columns, filters, badges, and any display/exclude/hide/show change on outbound flows (ACH OB / Legacy TPS Wire / Intercompany / Consolidated / Overnight) |
+| 7 | `Resware_OB`| **Escrow Outbound payments** (non-UI) — backend / workflow / API / webhook / retry / reverse / sync / posting work on the same outbound family above |
+| 8 | `Escrow_CEA`| **Escrow Dashboard main-screen enhancements** — Banks, Bank Accounts, Counterparty, My Payments, User Profile, faceted search (and any Escrow story that doesn't match a more specific rule). **Note:** Payment Monitoring belongs to `Escrow_OB`/`Resware_OB`, NOT here, because it is an outbound-lifecycle dashboard. |
 
 ✅ **Implementation reference:** `test/domain_context.py → classify_epp_area()` performs this classification automatically from the User Story's title, description, and acceptance criteria.
 

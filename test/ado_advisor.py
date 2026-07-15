@@ -609,32 +609,59 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     # generic "User does X" boilerplate.
     domain = build_domain_context(title, desc_clean, ac_clean)
 
+    # ── STORY SCOPE ANALYSIS ──────────────────────────────────────────────
+    # The user story's Description + Business Context + Acceptance Criteria
+    # are the SOURCE OF TRUTH for what to test. The domain catalogue only
+    # supplies labels / routes / API hints — never extra scope.
+    #
+    # ``scope`` tells the generator which RULE COV / RULE FUNC / RULE DATA
+    # expansions are actually relevant to *this* story:
+    #
+    #   • named_roles      → roles explicitly mentioned in the story
+    #                        (e.g. "As an Accounting User"). When this is
+    #                        non-empty, we treat it as the FULL allowed
+    #                        role list — do not pad with catalogue roles.
+    #   • out_of_scope     → lower-cased list of explicit out-of-scope
+    #                        items pulled from the "Out of Scope" / "Not
+    #                        in scope" section of the Description.
+    #   • allow_multi_role → True only if the story actually mentions
+    #                        more than one distinct role.
+    #   • allow_data       → True only if the story talks about data
+    #                        entry / forms / inputs / uploads.
+    #   • allow_ui         → True only if the story talks about UI /
+    #                        screen-rendering concerns AND the UI is
+    #                        not flagged as out-of-scope.
+    #   • allow_workflow   → True only when the story actually asks
+    #                        for an end-to-end workflow (and a UI
+    #                        redesign / workflow change is not OOS).
+    #   • allow_security   → True only if the story explicitly raises
+    #                        an auth / unauthorized / permission concern.
+    scope = _extract_story_scope(title, desc_clean, ac_clean, domain)
     # ── Detect story characteristics for conditional rule application ─────
-    has_roles = any(kw in combined for kw in [
-        'admin', 'role', 'permission', 'manager', 'approver', 'unauthorized', 'authoriz'
-    ])
-    has_data_input = any(kw in combined for kw in [
-        'input', 'enter', 'form', 'field', 'submit', 'upload', 'fill', 'dropdown'
-    ])
-    has_ui = any(kw in combined for kw in [
-        'button', 'click', 'screen', 'page', 'modal', 'dialog', 'menu', 'tab',
-        'display', 'ui', 'dropdown', 'tooltip', 'grid', 'table', 'view'
-    ])
+    # NOTE: these are now scope-aware — they only fire when the STORY
+    # actually talks about them. The domain catalogue still supplies
+    # the right *labels*, but never extra coverage scope.
+    has_data_input = scope['allow_data']
+    has_ui = scope['allow_ui']
     has_api = any(kw in combined for kw in [
         'api', 'endpoint', 'webhook', 'service', 'request', 'response', 'http'
     ])
+    has_roles = bool(scope['named_roles']) or scope['allow_security']
 
     # ── Roles ──────────────────────────────────────────────────────────────
-    # Prefer roles identified from the EPP domain catalogue; fall back to
-    # generic keyword extraction only when nothing matched.
-    if domain.get('roles'):
+    # SOURCE OF TRUTH = the story. If the story explicitly names roles
+    # (e.g. "As an Accounting User"), use ONLY those roles. The catalogue
+    # may add roles only when the story names none.
+    if scope['named_roles']:
+        roles_found = list(scope['named_roles'])
+    elif domain.get('roles'):
         roles_found = list(domain['roles'])
-        has_roles = True
     else:
         role_keywords = {
-            'admin': 'Admin', 'administrator': 'Admin', 'manager': 'Manager',
-            'approver': 'Approver', 'reviewer': 'Reviewer', 'operator': 'Operator',
-            'editor': 'Editor', 'viewer': 'Viewer'
+            'admin': 'Administrator', 'administrator': 'Administrator',
+            'manager': 'Manager', 'approver': 'Approver',
+            'reviewer': 'Reviewer', 'operator': 'Operator',
+            'editor': 'Editor', 'viewer': 'Viewer',
         }
         roles_found = []
         for kw, label in role_keywords.items():
@@ -760,7 +787,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
         # ── RULE GEN 02 — clean, business-friendly title per AC ──────────
         condition = _build_condition_phrase(then_text or when_text or ac_summary)
         actor = roles_found[0] if has_roles else 'system'
-        ac_title = f"{feature_label} {condition}" if condition else feature_label
+        ac_title = _assemble_title(feature_label, condition)
 
         # ── Domain-aware preconditions: prefer the GIVEN clause from the
         #    AC, but always layer in the portal/role/route context so the
@@ -841,9 +868,14 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE GEN 03: At least 1 Negative / Boundary / Unauthorized
+    # --------------------------------------------------------------------
+    # SCOPE-AWARE: the "Unauthorized user" Negative is only generated
+    # when the STORY actually raises an auth / permission concern. For
+    # narrow display / filter stories the AC itself is the negative
+    # (e.g. "Rejected transaction is NOT displayed in Failed tab").
     # ══════════════════════════════════════════════════════════════════════
     if not any(tc['test_category'] == 'Negative' for tc in test_cases):
-        if has_roles:
+        if scope['allow_security'] and has_roles and len(roles_found) >= 1:
             portal_label = domain.get('portal') or 'EPP'
             route_label = domain.get('route')
             wrong_role = domain.get('negative_role') or 'a role outside the allowed list'
@@ -880,7 +912,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
                 'test_category': 'Negative',
                 'ac_ref': 'Security',
             })
-        else:
+        elif scope['allow_data']:
             actor = roles_found[0]
             portal_label = domain.get('portal') or 'EPP'
             add_tc({
@@ -907,11 +939,17 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
                 'test_category': 'Negative',
                 'ac_ref': 'Negative',
             })
+        # else: the story is a narrow display / filter rule — the AC
+        # itself encodes the "negative" case, so no extra TC is needed.
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE COV 07: Role-Based Test Generation
+    # --------------------------------------------------------------------
+    # SCOPE-AWARE: only fires when the STORY itself names more than
+    # one role. Stories with a single named actor (e.g. "As an
+    # Accounting User …") will NOT get extra per-role TCs.
     # ══════════════════════════════════════════════════════════════════════
-    if has_roles and len(roles_found) > 1:
+    if scope['allow_multi_role'] and has_roles and len(roles_found) > 1:
         for role in roles_found[:3]:
             add_tc({
                 'title': f"{role} can perform {feature_label} per role permissions",
@@ -937,7 +975,12 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE COV 08 + RULE DATA 09: Data-Driven Coverage (only if data input)
+    # RULE COV 08 + RULE DATA 09: Data-Driven Coverage
+    # --------------------------------------------------------------------
+    # SCOPE-AWARE: ``has_data_input`` is now driven by ``scope['allow_data']``,
+    # so this block only fires when the STORY explicitly talks about
+    # data entry / form input / upload / CSV — never just because the
+    # screen happens to have inputs.
     # ══════════════════════════════════════════════════════════════════════
     if has_data_input:
         actor = roles_found[0]
@@ -989,7 +1032,11 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE FUNC 10: UI & Field Validation (only if UI mentioned)
+    # RULE FUNC 10: UI & Field Validation
+    # --------------------------------------------------------------------
+    # SCOPE-AWARE: ``has_ui`` is now driven by ``scope['allow_ui']``, so
+    # this block only fires when the STORY explicitly raises UI-rendering
+    # concerns AND the story has not flagged "UI redesign" as out-of-scope.
     # ══════════════════════════════════════════════════════════════════════
     if has_ui:
         actor = roles_found[0]
@@ -1025,10 +1072,15 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     # ══════════════════════════════════════════════════════════════════════
     # EPP DOMAIN: Canonical workflow walkthrough (only if we matched a
     # known screen and have explicit workflow steps for it).
-    # This adds genuine business-value coverage like "Retry a transmission-
-    # failed payment from /payments/monitoring" instead of a generic step.
+    # --------------------------------------------------------------------
+    # SCOPE-AWARE: skipped entirely when the story is a narrow display /
+    # filter rule (e.g. "Exclude Rejected from Failed tab") or when the
+    # workflow / payment-execution is flagged out-of-scope. Stories that
+    # actually ask for an end-to-end workflow still get one.
     # ══════════════════════════════════════════════════════════════════════
-    if domain.get('workflow_steps') and domain.get('confidence', 0) >= 0.4:
+    if (scope['allow_workflow']
+            and domain.get('workflow_steps')
+            and domain.get('confidence', 0) >= 0.4):
         wf_actor = domain.get('primary_role') or roles_found[0]
         wf_portal = domain.get('portal') or 'EPP'
         wf_route = domain.get('route')
@@ -1300,6 +1352,167 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     return test_cases, ac_clean, desc_clean, title
 
 
+# Role tokens we look for in the story text. Order/casing don't matter —
+# the lookup is case-insensitive on word boundaries. Aliases collapse to
+# the canonical EPP role name.
+#
+# IMPORTANT: every pattern must require a *role-like* context so that
+# common English verbs aren't mis-identified as roles. For example,
+# "support" is a verb in "transactions are grouped to support accounting
+# oversight" — that must NOT count as the "Support" role. We require
+# patterns like "as a <role>", "<role> user", "<role> role", or the
+# exact CamelCase identifier (e.g. AccountingUser, CEAFraudInvestigator).
+_ROLE_PATTERNS = (
+    # AccountingUser — covers "As an Accounting User", "AccountingUser",
+    # "Accounting User role", but NOT plain "accounting" as a noun/verb.
+    (r'\bas\s+an?\s+accounting\s+user\b',         'AccountingUser'),
+    (r'\baccounting\s+user\b',                    'AccountingUser'),
+    (r'\baccountinguser\b',                       'AccountingUser'),
+    # FieldUser
+    (r'\bas\s+an?\s+field\s+user\b',              'FieldUser'),
+    (r'\bfield\s+user\b',                         'FieldUser'),
+    (r'\bfielduser\b',                            'FieldUser'),
+    # Support — must be qualified to avoid the verb sense ("…to support…")
+    (r'\bas\s+an?\s+support\s+(?:user|agent|engineer)\b',
+                                                  'Support'),
+    (r'\bsupport\s+(?:user|agent|engineer|role|team)\b',
+                                                  'Support'),
+    # Administrator / Admin — same idea, must be qualified or stand-alone CamelCase
+    (r'\bas\s+an?\s+(?:admin(?:istrator)?)\b',    'Administrator'),
+    (r'\b(?:admin(?:istrator)?)\s+(?:user|role)\b',
+                                                  'Administrator'),
+    (r'\badministrator\b',                        'Administrator'),
+    # CEA Fraud Investigator
+    (r'\bas\s+an?\s+(?:cea\s+)?fraud\s+investigator\b',
+                                                  'CEAFraudInvestigator'),
+    (r'\bcea\s+fraud\s+investigator\b',           'CEAFraudInvestigator'),
+    (r'\bceafraudinvestigator\b',                 'CEAFraudInvestigator'),
+    (r'\bfraud\s+investigator\b',                 'CEAFraudInvestigator'),
+    # Account Verification Administrator
+    (r'\baccount\s+verification\s+administrator\b',
+                                                  'AccountVerificationAdministrator'),
+    (r'\baccountverificationadministrator\b',     'AccountVerificationAdministrator'),
+    # Generic role nouns (only when unambiguously a role reference)
+    (r'\bas\s+an?\s+approver\b',                  'Approver'),
+    (r'\bapprover\s+role\b',                      'Approver'),
+    (r'\bas\s+an?\s+reviewer\b',                  'Reviewer'),
+    (r'\breviewer\s+role\b',                      'Reviewer'),
+)
+
+
+def _extract_story_scope(title: str, desc_clean: str, ac_clean: str,
+                         domain: dict) -> dict:
+    """Build a story-scope dict from the User Story text.
+
+    Returns
+    -------
+    dict with keys:
+      ``named_roles``      : list[str]   roles explicitly mentioned in the story
+      ``out_of_scope``     : list[str]   lower-cased phrases pulled from the
+                                         "Out of Scope" section of the Description
+      ``allow_multi_role`` : bool        True iff the story names >1 role
+      ``allow_data``       : bool        True iff story talks about data input
+      ``allow_ui``         : bool        True iff story talks about UI AND UI is
+                                         not flagged out-of-scope
+      ``allow_workflow``   : bool        True iff a full workflow walkthrough is
+                                         genuinely in scope for this story
+      ``allow_security``   : bool        True iff story raises an auth /
+                                         permission concern
+      ``story_blob``       : str         lower-cased concatenation of all three
+                                         source fields (handy for downstream
+                                         keyword checks)
+    """
+    blob_raw = " ".join([title or '', desc_clean or '', ac_clean or ''])
+    blob = blob_raw.lower()
+
+    # ── 1. Named roles ────────────────────────────────────────────────────
+    named_roles: list = []
+    for pat, canonical in _ROLE_PATTERNS:
+        if re.search(pat, blob, flags=re.IGNORECASE) and canonical not in named_roles:
+            named_roles.append(canonical)
+
+    # ── 2. Out-of-scope section (markdown / plain-text headings) ──────────
+    out_of_scope: list = []
+    oos_match = re.search(
+        r'(?:out\s*of\s*scope|not\s+in\s+scope)\b[\s:•\-–—]*'
+        r'(.+?)(?=(?:\n\s*\n)|(?:in\s+scope)|(?:notes?\s*[:|]?\s)|\Z)',
+        blob_raw, flags=re.IGNORECASE | re.DOTALL,
+    )
+    if oos_match:
+        chunk = oos_match.group(1)
+        # Split on bullets / line breaks / semicolons
+        for line in re.split(r'[•\u2022\n;]+', chunk):
+            line = line.strip(' -–—:.\t')
+            if 4 <= len(line) <= 200:
+                out_of_scope.append(line.lower())
+
+    def _oos_says(*needles: str) -> bool:
+        return any(any(n in item for n in needles) for item in out_of_scope)
+
+    # ── 3. Capability cues — VERY conservative on purpose ─────────────────
+    # Multi-role only when the story actually names >1 role.
+    allow_multi_role = len(named_roles) > 1
+
+    # Data entry only when the story talks about form input, upload, etc.
+    # — and not when the only "input" word is part of a system message.
+    data_cues = (
+        'enter ', 'enters ', 'input ', 'inputs ', 'submit', 'form ', 'fill ',
+        'upload ', 'csv', 'dropdown', 'text field', 'text box',
+        'select ', 'choose ', 'attach ',
+    )
+    allow_data = any(c in blob for c in data_cues) and not _oos_says(
+        'data entry', 'form', 'csv', 'upload')
+
+    # UI rendering coverage only when the story raises UI-rendering concerns
+    # AND the story doesn't explicitly say "UI redesign is out of scope".
+    ui_cues = (
+        'button', 'tooltip', 'modal', 'dialog', 'render', 'layout',
+        'design', 'redesign', 'colour', 'color', 'icon', 'badge',
+        'visibility of', 'visible on', 'mandatory field',
+    )
+    ui_oos = _oos_says('ui ', 'ui redesign', 'redesign', 'layout',
+                       'new monitoring tabs')
+    allow_ui = any(c in blob for c in ui_cues) and not ui_oos
+
+    # End-to-end workflow walkthroughs only when the story actually asks
+    # for a workflow (e.g., create / submit / approve flow) AND the story
+    # isn't a narrow filtering / display rule, AND the workflow isn't
+    # flagged out-of-scope.
+    workflow_cues = (
+        'workflow', 'end-to-end', 'happy path', 'submit and', 'approve and',
+        'create and ', 'release ', 'reverse ', 'retry ',
+    )
+    workflow_oos = _oos_says('workflow', 'payment execution',
+                             'transmission', 'settlement')
+    # Narrow rule / display-only stories should NOT get a workflow TC.
+    narrow_rule = any(c in blob for c in (
+        'exclude ', 'excluded ', 'hide ', 'hidden ', 'filter ', 'filtered ',
+        'show only', 'do not display', 'is not displayed',
+    ))
+    allow_workflow = (any(c in blob for c in workflow_cues)
+                      and not workflow_oos
+                      and not narrow_rule)
+
+    # Security / unauthorized-access coverage only when the story raises it.
+    security_cues = (
+        'unauthorized', 'unauthorised', 'forbidden', 'denied',
+        'permission', 'rbac', 'access control', 'not allowed',
+        '401', '403',
+    )
+    allow_security = any(c in blob for c in security_cues)
+
+    return {
+        'named_roles':       named_roles,
+        'out_of_scope':      out_of_scope,
+        'allow_multi_role':  allow_multi_role,
+        'allow_data':        allow_data,
+        'allow_ui':          allow_ui,
+        'allow_workflow':    allow_workflow,
+        'allow_security':    allow_security,
+        'story_blob':        blob,
+    }
+
+
 def _short_feature(title):
     """Short, business-friendly feature label from a user story title."""
     t = re.sub(r'^(EPP[:\-]\s*)', '', title, flags=re.IGNORECASE).strip()
@@ -1355,31 +1568,244 @@ def _clean_clause(text):
 
 
 def _build_condition_phrase(text):
-    """Turn a free-form GWT clause into a SHORT, business-readable
-    phrase suitable for a test case title (e.g. "displays bank filter",
-    "rejects invalid amount"). Returns at most ~45 chars.
+    """Distil a free-form GWT clause into a SHORT, business-readable
+    outcome phrase suitable for a test case title.
+
+    The function tries to **recognise** the outcome pattern and emit a
+    grammatical fragment such as:
+
+        "excludes Rejected from Failed tab"
+        "blocks unauthorised users"
+        "rejects invalid amount"
+        "displays bank filter"
+        "returns 403 for FieldUser"
+        "saves the wire integration"
+
+    It never truncates mid-preposition / mid-article — if a hard length
+    cap is needed, it always re-cuts at a clean word boundary and drops
+    the trailing function word.
     """
     t = _clean_clause(text)
     if not t:
         return ''
-    # Drop common AC noise & filler
+
+    # ── 1. Strip noise ───────────────────────────────────────────────────
     t = re.sub(r'\bAC\s*\d+\b[:\-]?\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^(given|when|then|and|but)\s+', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(the\s+)?(system|user|application|page|screen)\s+(should|will|must|shall)\s+',
-               '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+(be\s+)?', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(verify|validate|ensure|check|confirm)\s+(that\s+)?', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(verify|validate|ensure|check|confirm)\s+(that\s+)?', '',
+               t, flags=re.IGNORECASE)
+    # Drop leading subject words ("the system should", "user will", etc.)
+    t = re.sub(r'^(the\s+)?(system|user|application|page|screen|app)\s+'
+               r'(should|will|must|shall|can)\s+', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+(be\s+)?', '',
+               t, flags=re.IGNORECASE)
+    # Drop a leading article so fallback fragments don't read "Feature the X …"
     t = re.sub(r'^(a|an|the)\s+', '', t, flags=re.IGNORECASE)
-    # Cut at first sentence/clause boundary OR at a comma if line is long
-    t = re.split(r'[.;:]\s+', t)[0]
-    if len(t) > 45 and ',' in t:
-        t = t.split(',', 1)[0]
+
+    # First sentence only
+    t = re.split(r'[.;]\s+', t)[0]
+    # Compound clauses joined by " and " — keep only the first outcome
+    # so titles don't try to stuff two verbs in (e.g.
+    # "is created and a confirmation is shown" → "is created").
+    parts = re.split(r'\s+and\s+', t, maxsplit=1)
+    if len(parts) == 2 and len(parts[0]) >= 10:
+        t = parts[0]
     t = re.sub(r'\s+', ' ', t).strip().rstrip(',;:- ')
-    # Hard cap ~45 chars at last word boundary
-    if len(t) > 45:
-        cut = t[:45].rsplit(' ', 1)[0]
-        t = cut.rstrip(',;:- ')
-    return t
+    if not t:
+        return ''
+
+    # ── 2. Theme-based distillation — try patterns in order, return
+    #       the FIRST one that fires. Each pattern produces a clean,
+    #       grammatical title fragment that combines naturally with
+    #       the feature label via `_assemble_title` below.
+    low = t.lower()
+
+    # Pattern: "<X> is/are NOT displayed in/on <Y>" → "excludes <X> from <Y>"
+    m = re.search(r'(?:the\s+)?(\w[\w\s\-]{0,40}?)\s+(?:is|are)\s+not\s+'
+                  r'(?:displayed|shown|listed|visible)\s+(?:in|on|under|within|inside)\s+'
+                  r'(?:the\s+)?(\w[\w\s\-]{0,40}?)$',
+                  low)
+    if m:
+        what = _titlecase_phrase(m.group(1))
+        where = _titlecase_phrase(m.group(2))
+        return f"excludes {what} from {where}".strip()
+
+    # Pattern: "<X> is/are displayed in/on <Y>" → "shows <X> in <Y>"
+    m = re.search(r'(?:the\s+)?(\w[\w\s\-]{0,40}?)\s+(?:is|are)\s+'
+                  r'(?:displayed|shown|listed|visible)\s+(?:in|on|under|within|inside)\s+'
+                  r'(?:the\s+)?(\w[\w\s\-]{0,40}?)$',
+                  low)
+    if m:
+        what = _titlecase_phrase(m.group(1))
+        where_raw = m.group(2).strip().lower()
+        # "on the page" / "in the screen" add no information — drop them
+        if where_raw in {'page', 'screen', 'view', 'ui', 'app',
+                         'application', 'system'}:
+            return f"shows {what}".strip()
+        where = _titlecase_phrase(where_raw)
+        return f"shows {what} in {where}".strip()
+
+    # Pattern: "<X> is/are displayed" (no location) → "shows <X>"
+    m = re.search(r'(?:the\s+)?(\w[\w\s\-]{0,40}?)\s+(?:is|are)\s+'
+                  r'(?:displayed|shown|listed|visible|presented)\b', low)
+    if m:
+        what = _titlecase_phrase(m.group(1))
+        return f"shows {what}".strip()
+
+    # Pattern: "<X> is/are blocked / denied / rejected …"
+    m = re.search(r'(?:the\s+)?(\w[\w\s\-]{0,30}?)\s+(?:is|are)\s+'
+                  r'(blocked|denied|rejected|forbidden|prevented|hidden)',
+                  low)
+    if m:
+        what = _titlecase_phrase(m.group(1))
+        verb = m.group(2)
+        if verb in ('rejected',):
+            return f"rejects {what}"
+        if verb in ('hidden',):
+            return f"hides {what}"
+        return f"blocks {what}"
+
+    # Pattern: API returns HTTP <code>
+    m = re.search(r'(?:returns?|responds?\s+with)\s+(?:http\s+)?'
+                  r'(\d{3})\b(?:\s+(?:for|to)\s+(?:the\s+|a\s+|an\s+)?'
+                  r'(?P<actor>[A-Za-z][\w\-]+))?', low)
+    if m:
+        code = m.group(1)
+        actor_raw = m.group('actor') or ''
+        # Reject actors that are pure function words
+        if actor_raw and actor_raw.lower() in _TRAILING_FUNC_WORDS:
+            actor_raw = ''
+        actor = _titlecase_phrase(actor_raw) if actor_raw else ''
+        return f"returns HTTP {code}" + (f" for {actor}" if actor else '')
+
+    # Pattern: "<X> is/are saved/persisted/created/updated/deleted"
+    m = re.search(r'(?:the\s+)?(\w[\w\s\-]{0,30}?)\s+(?:is|are)\s+'
+                  r'(saved|persisted|created|updated|deleted|removed)', low)
+    if m:
+        what = _titlecase_phrase(m.group(1))
+        verb_map = {'saved': 'saves', 'persisted': 'persists',
+                    'created': 'creates', 'updated': 'updates',
+                    'deleted': 'deletes', 'removed': 'removes'}
+        return f"{verb_map[m.group(2)]} {what}"
+
+    # Pattern: count / summary / total comparison
+    #   "the count on the Failed tab matches the sum of transmission-failed payments"
+    #   → "reflects correct Failed-tab count"
+    m = re.search(r'\b(count|summary|total|aggregate|sum|tally)\b\s+'
+                  r'(?:on|of|in|for)?\s*(?:the\s+)?(\w[\w\s\-]{0,30}?)\s+'
+                  r'(?:matches|reflects|equals|sums|is|aggregates)', low)
+    if m:
+        scope_what = _titlecase_phrase(m.group(2))
+        return f"reflects correct {scope_what} {m.group(1).lower()}"
+
+    # Pattern: starts with an outcome verb already — keep first 6-7 words
+    if re.match(r'^(excludes?|includes?|hides?|shows?|displays?|rejects?|'
+                r'allows?|blocks?|enables?|disables?|persists?|saves?|'
+                r'returns?|sends?|navigates?|opens?|filters?)\b', low):
+        return _clip_words(t, max_words=8)
+
+    # ── 3. Fallback: clip to a clean ≤ 8-word fragment without breaking
+    #       grammar (drops trailing prepositions / articles / conjunctions).
+    return _clip_words(t, max_words=8)
+
+
+# Function words that must never appear at the END of a title fragment.
+_TRAILING_FUNC_WORDS = frozenset({
+    'a', 'an', 'the', 'in', 'on', 'of', 'to', 'for', 'with', 'from',
+    'by', 'at', 'as', 'and', 'or', 'but', 'into', 'onto', 'over',
+    'under', 'between', 'within', 'inside',
+})
+
+
+def _clip_words(text: str, max_words: int = 8) -> str:
+    """Clip ``text`` to at most ``max_words`` words and strip any trailing
+    function word so the fragment ends on a content word."""
+    words = (text or '').strip().split()
+    if not words:
+        return ''
+    if len(words) > max_words:
+        words = words[:max_words]
+    # Strip trailing function words / punctuation
+    while words and words[-1].lower().strip(',;:.-') in _TRAILING_FUNC_WORDS:
+        words.pop()
+    return ' '.join(words).rstrip(',;:- ')
+
+
+def _titlecase_phrase(phrase: str) -> str:
+    """Title-case a phrase while preserving small connector words and
+    EPP-specific identifiers (e.g. "Failed tab" not "Failed Tab" if the
+    second word is a common noun)."""
+    p = re.sub(r'\s+', ' ', (phrase or '').strip())
+    if not p:
+        return ''
+    parts = p.split(' ')
+    out = []
+    keep_lower = {'tab', 'tabs', 'screen', 'page', 'view', 'list',
+                  'modal', 'dialog', 'dashboard', 'queue', 'bucket',
+                  'and', 'or', 'of', 'in', 'on', 'the'}
+    # Canonical EPP identifiers — always rendered with their exact casing.
+    epp_camel = {
+        'fielduser':                       'FieldUser',
+        'accountinguser':                  'AccountingUser',
+        'support':                         'Support',
+        'administrator':                   'Administrator',
+        'ceafraudinvestigator':            'CEAFraudInvestigator',
+        'accountverificationadministrator':'AccountVerificationAdministrator',
+        'iba':                             'IBA',
+        'ach':                             'ACH',
+        'rtp':                             'RTP',
+        'sda':                             'SDA',
+        'samedayach':                      'SameDayACH',
+    }
+    for i, w in enumerate(parts):
+        wl = w.lower()
+        if wl in epp_camel:
+            out.append(epp_camel[wl])
+        elif i > 0 and wl in keep_lower:
+            out.append(wl)
+        elif w.isupper() and len(w) <= 4:        # acronyms ACH / RTP / IBA
+            out.append(w)
+        else:
+            out.append(wl.capitalize())
+    # Restore exact match for well-known EPP terms
+    text = ' '.join(out)
+    for term in ('Failed', 'Pending', 'Rejected', 'Completed',
+                 'Transmission Failed', 'Consolidation Queue',
+                 'Overnight Queue'):
+        text = re.sub(rf'\b{term}\b', term, text, flags=re.IGNORECASE)
+    return text
+
+
+def _assemble_title(feature_label: str, condition: str) -> str:
+    """Stitch the feature label and a distilled condition phrase into a
+    natural, grammatical test-case title.
+
+    Examples
+    --------
+    >>> _assemble_title("Payment Monitoring", "excludes Rejected from Failed tab")
+    'Payment Monitoring excludes Rejected from Failed tab'
+    >>> _assemble_title("Payment Monitoring", "")
+    'Payment Monitoring works as specified'
+    >>> _assemble_title("Wire Integration", "returns HTTP 403 for FieldUser")
+    'Wire Integration returns HTTP 403 for FieldUser'
+    """
+    feat = (feature_label or '').strip()
+    cond = (condition or '').strip()
+    if not feat and not cond:
+        return 'Feature works as specified'
+    if not cond:
+        return f"{feat} works as specified"
+    if not feat:
+        return cond[0].upper() + cond[1:]
+
+    # If the condition already starts with the feature label or with a
+    # subject ("the system", "user"), don't repeat it.
+    if cond.lower().startswith(feat.lower()):
+        return cond[0].upper() + cond[1:]
+    if re.match(r'^(the\s+system|the\s+user|user|system)\b', cond, re.IGNORECASE):
+        return cond[0].upper() + cond[1:]
+
+    return f"{feat} {cond}"
 
 
 def _build_objective(feature_label, given_text, when_text, then_text, ac_summary, story_title=''):
@@ -1449,7 +1875,14 @@ def _build_objective(feature_label, given_text, when_text, then_text, ac_summary
 
 def _normalize_title(t):
     """RULE GEN 02 — start with 'Verify', no 'that', collapse whitespace,
-    no trailing punctuation, max 90 chars (precise & to-the-point)."""
+    no trailing punctuation, max 90 chars (precise & to-the-point).
+
+    Crucially, the 90-char cap NEVER ends on a preposition, article, or
+    conjunction (a / the / in / on / of / to / for / with / from / by /
+    at / as / and / or / but / into / onto / over / under / between /
+    within / inside). If a cut would leave such a word at the end, it
+    is dropped so the title still reads as a complete clause.
+    """
     t = re.sub(r'\s+', ' ', t or '').strip()
     t = re.sub(r'\bthat\b\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[\-\u2013\u2014\s]+', '', t)
@@ -1459,7 +1892,12 @@ def _normalize_title(t):
     t = re.sub(r'\s+', ' ', t).strip()
     if len(t) > 90:
         cut = t[:90].rsplit(' ', 1)[0]
-        t = cut
+        # Drop any trailing function words so the title still parses
+        words = cut.split(' ')
+        while words and words[-1].lower().strip(',;:.-') in _TRAILING_FUNC_WORDS:
+            words.pop()
+        cut = ' '.join(words).rstrip(',;:- ')
+        t = cut if cut else t[:90]
     return t
 
 
@@ -2004,7 +2442,13 @@ def generate_and_push_test_cases(story_id):
     print(f"  Generating Test Cases for User Story #{story_id}")
     print(f"{'='*60}")
 
-    # 1. Fetch full user story details
+    def _phase(msg: str) -> None:
+        """Print a clearly-flagged progress phase and flush immediately
+        so the user can see the pipeline running in real time."""
+        print(msg, flush=True)
+
+    # ── PHASE 1/5 ── Fetch full user story details
+    _phase("\n[1/5] Fetching User Story from Azure DevOps…")
     work_item = get_work_item_full_details(story_id)
     if not work_item:
         print("ERROR: Could not fetch user story. Check the ID and your PAT.")
@@ -2019,23 +2463,40 @@ def generate_and_push_test_cases(story_id):
     description = fields.get('System.Description', '')
     ac_raw = fields.get('Microsoft.VSTS.Common.AcceptanceCriteria', '')
 
-    print(f"  Title:    {title}")
-    print(f"  State:    {state}")
-    print(f"  Assigned: {assignee}")
-    print(f"  AC found: {'Yes' if ac_raw else 'No'}")
+    print(f"      Title    : {title}")
+    print(f"      State    : {state}")
+    print(f"      Assigned : {assignee}")
+    print(f"      Area     : {area_path}")
+    print(f"      AC found : {'Yes' if ac_raw else 'No'}", flush=True)
 
-    # 1.5 Build a historical context from neighbouring User Stories /
-    #     Test Cases in the same Area Path. Best-effort: any failure
-    #     here is non-fatal and just means we proceed without prior-art.
+    # ── PHASE 2/5 ── Resolve EPP domain context from documentation
+    _phase("\n[2/5] Resolving EPP domain context "
+           "(portal / screen / roles / API hints)…")
+    pre_domain = build_domain_context(
+        title, clean_html(description) if description else '',
+        clean_html(ac_raw) if ac_raw else '')
+    epp_area_tag = pre_domain.get('epp_area')
+    epp_area_reason = pre_domain.get('epp_area_reason')
+    matched_screen = pre_domain.get('matched_screen') or '—'
+    matched_portal = pre_domain.get('portal') or '—'
+    print(f"      Portal        : {matched_portal}")
+    print(f"      Screen        : {matched_screen}")
+    if epp_area_tag:
+        print(f"      EPP area tag  : {epp_area_tag}  "
+              f"(reason: {epp_area_reason})")
+    else:
+        print("      EPP area tag  : —")
+    print(f"      Catalog roles : "
+          f"{', '.join(pre_domain.get('roles') or []) or '—'}", flush=True)
+
+    # ── PHASE 3/5 ── Historical context from prior User Stories in same area
+    _phase("\n[3/5] Searching prior User Stories in the same area "
+           "for relevant historical context…")
     history_ctx = None
     try:
-        # Pre-classify the story so we can narrow the WIQL by EPP area-tag
-        pre_domain = build_domain_context(
-            title, clean_html(description) if description else '',
-            clean_html(ac_raw) if ac_raw else '')
-        epp_area_tag = pre_domain.get('epp_area')
-        print(f"  Looking up neighbouring User Stories in area: {area_path}"
-              + (f" (tag: {epp_area_tag})" if epp_area_tag else ""))
+        print(f"      WIQL query : Area Path UNDER '{area_path}'"
+              + (f"  &  tag '{epp_area_tag}'" if epp_area_tag else ""),
+              flush=True)
         history_ctx = build_history_context(
             current_story_id=int(story_id),
             current_area_path=area_path,
@@ -2045,21 +2506,39 @@ def generate_and_push_test_cases(story_id):
             epp_area=epp_area_tag,
         )
         if history_ctx and history_ctx.get('neighbour_stories'):
-            print(f"  History: {history_ctx['summary']}")
+            print(f"      Result     : {history_ctx['summary']}", flush=True)
+            # Show a short list of the prior stories so the user knows
+            # exactly what informed the generation.
+            for n in history_ctx['neighbour_stories'][:5]:
+                print(f"                   - #{n.get('id'):<6} "
+                      f"[{(n.get('state') or '').ljust(14)}] "
+                      f"{(n.get('title') or '')[:80]}")
+            if history_ctx.get('neighbour_domain_keywords'):
+                print(f"      Keywords   : "
+                      + ", ".join(
+                          k.capitalize()
+                          for k in history_ctx['neighbour_domain_keywords'][:10]
+                      ), flush=True)
         else:
-            print("  History: no comparable prior User Stories found")
+            print("      Result     : no comparable prior User Stories found",
+                  flush=True)
     except Exception as e:
-        print(f"  History: lookup skipped ({e})")
+        print(f"      Result     : lookup skipped ({e})", flush=True)
         history_ctx = None
 
-    # 2. Generate test cases (history is used as supplemental context)
+    # ── PHASE 4/5 ── Generate test cases from AC + scope + domain + history
+    _phase("\n[4/5] Generating test cases from Acceptance Criteria "
+           "(scope-strict, RULE SCOPE 16)…")
     test_cases_raw, ac_clean, desc_clean, _ = \
         generate_test_cases_from_acceptance_criteria(work_item, history=history_ctx)
     if not test_cases_raw:
         print("WARNING: No test cases could be generated.")
         return
 
-    print(f"  Generated {len(test_cases_raw)} test cases.")
+    print(f"      Generated  : {len(test_cases_raw)} test case(s)", flush=True)
+    for i, tc in enumerate(test_cases_raw, 1):
+        print(f"                   {i:2d}. [{tc.get('ac_ref','?'):>14s}] "
+              f"{tc['title']}")
 
     # Prepare test cases data for JSON serialization
     import uuid as _uuid
@@ -2369,9 +2848,11 @@ def generate_and_push_test_cases(story_id):
     port = 8765
     server = HTTPServer(('127.0.0.1', port), ReviewHandler)
 
-    print(f"\n  Review page: http://localhost:{port}/review?s={current_session_id[:8]}")
-    print(f"  Opening in browser...")
-    print(f"  (Select test cases, then click 'Add to ADO'. Press Ctrl+C to stop.)\n")
+    print(f"\n[5/5] Review page ready — opening in your browser…", flush=True)
+    print(f"      URL : http://localhost:{port}/review?s={current_session_id[:8]}")
+    print(f"      Tip : select the test cases you want, then click 'Add to ADO'.")
+    print(f"            Press Ctrl+C in this terminal to stop the server.\n",
+          flush=True)
 
     webbrowser.open(f"http://localhost:{port}/review?s={current_session_id}")
 

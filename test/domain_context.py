@@ -444,9 +444,24 @@ def _pick_primary_role(roles: List[str]) -> Optional[str]:
 # ────────────────────────────────────────────────────────────────────────
 
 _OUTBOUND_KWS = (
+    # Outbound monitoring & exception management (Payments Monitoring
+    # dashboard tabs) — listed FIRST so the classifier reports the
+    # most descriptive trigger when matching.
+    "payments monitoring", "payment monitoring",
+    "monitoring dashboard", "monitoring summary",
+    "monitoring screen", "monitoring tab",
+    "failed tab", "failed bucket", "failed transactions",
+    "transmission failed", "transmission-failed",
+    "rejected transaction", "rejected payment",
+    "retry payment", "retry intent", "retry-all",
+    "reverse payment", "mark as posted", "resolve manually",
+    "payment intent", "payment intents",
+    "stuck payment", "stuck payments",
+    # Direction labels
     "outbound", "ach outbound", "ach ob",
     "legacy tps wire", "tps wire", "legacy tps", "legacy-tps",
     "legacy tps intercompany", "intercompany",
+    # Outbound payment families
     "consolidated payment", "consolidation queue",
     "overnight queue", "overnight payment",
     "disbursement", "disburse",
@@ -486,12 +501,37 @@ _AP_PORTAL_UI_KWS = (
 )
 
 _ESCROW_CEA_KWS = (
+    # Banks / Bank Accounts management
     "banks list", "bank accounts", "bank-accounts",
-    "internal bank account", "counterpart",
-    "payment monitoring", "monitoring screen",
-    "payment history", "payments history",
+    "internal bank account", "iba ",
+    # Counterparty management
+    "counterpart",
+    # User-facing self-service screens (not the outbound monitoring screen!)
     "my payments", "profile screen", "user profile",
     "faceted search",
+)
+
+# Signals that an Escrow Outbound story is specifically a UI / display
+# change (filter, hide, exclude, show, layout, render, tab, badge, etc.).
+# Used to pick Escrow_OB vs Resware_OB.
+#
+# Order matters: more specific / content-meaningful signals come FIRST
+# so ``_first_hit`` reports the most representative trigger. Generic
+# words like "redesign" or "layout" come last so they only surface as
+# the reason when nothing more specific matched.
+_OB_UI_KWS = (
+    # Filtering / visibility — the most common outbound UI work
+    "exclude", "excluded", "hide", "hidden",
+    "display", "displayed", "show", "shown",
+    "filter", "filtered", "filtering",
+    # Dashboard surface elements
+    "tab", "tabs", "badge", "label", "tooltip",
+    "grid", "table", "column", "columns",
+    "render", "renders", "rendering",
+    # Broader UI signals (kept last so they don't crowd out the above)
+    "ui change", "ui changes", "ui update", "ui updates",
+    "screen change", "screen update", "redesign", "layout",
+    "front-end", "frontend",
 )
 
 
@@ -499,68 +539,106 @@ def _has_any(text: str, words: Tuple[str, ...]) -> bool:
     return any(w in text for w in words)
 
 
-def classify_epp_area(text: str, portal: str) -> Optional[str]:
-    """Pick the single EPP area-tag for an ADO test case based on the
-    lowercased combined text of (title + description + AC) and the
-    already-detected portal name.
+def _first_hit(text: str, words: Tuple[str, ...]) -> Optional[str]:
+    """Return the FIRST keyword from ``words`` that occurs in ``text``,
+    or ``None`` if none match. Used so the classifier can report *why*
+    it picked a given tag."""
+    for w in words:
+        if w in text:
+            return w
+    return None
 
-    Returns one of:
-      'AP_Bulk', 'AP_WD', 'AP_Portal',
-      'STEPS_OB',
-      'Resware_OB', 'Escrow_OB', 'Escrow_IB', 'Escrow_CEA'
-    or None when the story doesn't fit any defined area.
+
+def classify_epp_area_with_reason(
+    text: str, portal: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Classify a User Story into ONE EPP area-tag and return the
+    keyword (or rule label) that triggered the classification.
+
+    Returns
+    -------
+    (tag, reason)
+        tag    : one of 'AP_Bulk', 'AP_WD', 'AP_Portal', 'STEPS_OB',
+                 'Resware_OB', 'Escrow_OB', 'Escrow_IB', 'Escrow_CEA',
+                 or None when the story doesn't fit any defined area.
+        reason : short human-readable string explaining the match, e.g.
+                 ``"keyword 'payments monitoring' + UI signal 'exclude'"``
+                 or ``"generic fallback for Escrow Dashboard"``.
     """
     is_ap = portal == "AP Admin Portal"
     is_escrow = portal == "Escrow Dashboard"
-    has_outbound = _has_any(text, _OUTBOUND_KWS)
-    has_inbound = _has_any(text, _INBOUND_KWS)
-    has_ui = any(k in text for k in (
-        " ui ", "ui change", "ui changes", "screen change",
-        "screen update", "ui update", "front-end", "frontend",
-        "redesign", "layout", "form change",
-    ))
 
     # ── 1. STEPS integration + outbound (most specific — check FIRST) ──
-    if _has_any(text, _STEPS_KWS) and has_outbound:
-        return "STEPS_OB"
+    steps_hit = _first_hit(text, _STEPS_KWS)
+    if steps_hit:
+        ob_hit = _first_hit(text, _OUTBOUND_KWS)
+        if ob_hit:
+            return "STEPS_OB", f"keyword '{steps_hit}' + outbound '{ob_hit}'"
 
     # ── 2. AP Admin → Workday / Vendor flows ───────────────────────────
-    if _has_any(text, _WORKDAY_KWS):
-        return "AP_WD"
+    wd_hit = _first_hit(text, _WORKDAY_KWS)
+    if wd_hit:
+        return "AP_WD", f"keyword '{wd_hit}'"
 
     # ── 3. AP Admin → Bulk Payments ────────────────────────────────────
-    if _has_any(text, _BULK_KWS) or (is_ap and "bulk" in text):
-        return "AP_Bulk"
+    bulk_hit = _first_hit(text, _BULK_KWS)
+    if bulk_hit:
+        return "AP_Bulk", f"keyword '{bulk_hit}'"
+    if is_ap and "bulk" in text:
+        return "AP_Bulk", "AP portal + 'bulk' mention"
 
     # ── 4. AP Admin → UI / vendor-profile / party-info changes ─────────
-    if is_ap and (_has_any(text, _AP_PORTAL_UI_KWS) or has_ui):
-        return "AP_Portal"
+    ap_ui_hit = _first_hit(text, _AP_PORTAL_UI_KWS)
+    if is_ap and ap_ui_hit:
+        return "AP_Portal", f"AP portal + '{ap_ui_hit}'"
 
     # ── 5. Escrow Inbound (EMD / public form / new payment request) ────
-    if is_escrow and has_inbound:
-        return "Escrow_IB"
+    inb_hit = _first_hit(text, _INBOUND_KWS)
+    if is_escrow and inb_hit:
+        return "Escrow_IB", f"keyword '{inb_hit}'"
 
-    # ── 6. Escrow Outbound — UI change variant takes precedence ────────
-    if is_escrow and has_outbound and has_ui:
-        return "Escrow_OB"
-
-    # ── 7. Escrow + Outbound (Resware/legacy-TPS/consolidated/overnight)
-    if is_escrow and has_outbound:
-        return "Resware_OB"
+    # ── 6/7. Escrow Outbound family ────────────────────────────────────
+    # Includes the Payments Monitoring dashboard (Failed / Transmission
+    # Failed / Consolidation / Rejected tabs) because those screens
+    # exclusively deal with the OUTBOUND payment lifecycle.
+    #
+    # UI-flavoured outbound stories (display / filter / hide / exclude /
+    # tab / column changes) → Escrow_OB.
+    # Backend / workflow outbound stories → Resware_OB.
+    if is_escrow:
+        ob_hit = _first_hit(text, _OUTBOUND_KWS)
+        if ob_hit:
+            ui_hit = _first_hit(text, _OB_UI_KWS)
+            if ui_hit:
+                return ("Escrow_OB",
+                        f"outbound keyword '{ob_hit}' + UI signal '{ui_hit}'")
+            return "Resware_OB", f"outbound keyword '{ob_hit}' (no UI signal)"
 
     # ── 8. Escrow main-screen enhancement (Banks, Counterparty, etc.) ──
-    if is_escrow and _has_any(text, _ESCROW_CEA_KWS):
-        return "Escrow_CEA"
+    if is_escrow:
+        cea_hit = _first_hit(text, _ESCROW_CEA_KWS)
+        if cea_hit:
+            return "Escrow_CEA", f"main-screen keyword '{cea_hit}'"
 
     # ── 9. Generic AP Admin fallback when portal matched ───────────────
     if is_ap:
-        return "AP_Portal"
+        return "AP_Portal", "generic fallback for AP Admin Portal"
 
     # ── 10. Generic Escrow fallback when portal matched ────────────────
     if is_escrow:
-        return "Escrow_CEA"
+        return "Escrow_CEA", "generic fallback for Escrow Dashboard"
 
-    return None
+    return None, None
+
+
+def classify_epp_area(text: str, portal: str) -> Optional[str]:
+    """Backward-compatible wrapper — returns just the tag (no reason).
+
+    Existing callers that don't need the trigger reason keep working.
+    New callers should prefer ``classify_epp_area_with_reason``.
+    """
+    tag, _reason = classify_epp_area_with_reason(text, portal)
+    return tag
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -684,7 +762,7 @@ def build_domain_context(title: str,
         preconditions.append(f"User can reach the route {route}")
 
     # EPP area-tag classification (drives the ADO tag on the test case)
-    epp_area = classify_epp_area(combined, portal)
+    epp_area, epp_area_reason = classify_epp_area_with_reason(combined, portal)
 
     return {
         "portal": portal,
@@ -699,6 +777,10 @@ def build_domain_context(title: str,
         "matched_screen": matched,
         "confidence": round(confidence, 2),
         "epp_area": epp_area,
+        # Short human-readable explanation of WHY the area was picked;
+        # surfaced in the generator's phase-2 log so the tag is never
+        # mysterious.
+        "epp_area_reason": epp_area_reason,
     }
 
 
