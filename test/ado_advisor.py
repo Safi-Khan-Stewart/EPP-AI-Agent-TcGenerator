@@ -2268,13 +2268,14 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         priority_map = {'High': 1, 'Medium': 2, 'Low': 3}
         priority = priority_map.get(priority, 2)
 
-    # Build the tag list. Always include "Gen-AI" and the mandatory
-    # "AI TestCase" tag, plus the test_type and test_category (from
+    # Build the tag list. The only mandatory origin tag going forward
+    # is "AI TestCase" (the older "Gen-AI" marker has been retired per
+    # QA guidance). We then add the test_type and test_category (from
     # extra_fields) and any EPP area tag (AP_Bulk / Resware_OB / etc.).
     # These are surfaced via System.Tags so they remain visible in ADO
     # even when the project's process template lacks the Custom.* fields.
     # Tags in ADO are semicolon-separated.
-    tag_parts = ["Gen-AI", "AI TestCase"]
+    tag_parts = ["AI TestCase"]
     if extra_fields:
         tt = (extra_fields.get('Custom.TestType') or '').strip()
         tc_cat = (extra_fields.get('Custom.TestCategory') or '').strip()

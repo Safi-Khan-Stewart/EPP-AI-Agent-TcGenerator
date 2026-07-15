@@ -216,15 +216,14 @@ Before generating test cases for a new User Story, the AI must:
 ### RULE TAG 13: Mandatory Test Case Tags
 Every test case pushed to ADO **must** carry the following tags in `System.Tags` (semicolon-separated):
 
-1. `Gen-AI` — origin marker for AI-generated content.
-2. `AI TestCase` — mandatory generator tag (replaces the older `AI Test Case Generator`).
-3. The `Test Type` value (split into one tag per word when combined, e.g. `Smoke & Regression` → `Smoke` + `Regression`).
-4. The `Test Category` value (`Functional`, `API`, or `Negative`).
-5. **Exactly one EPP area tag** from RULE TAG 14 below.
+1. `AI TestCase` — mandatory generator/origin tag (replaces the older `AI Test Case Generator` and the previously-used `Gen-AI` marker).
+2. The `Test Type` value (split into one tag per word when combined, e.g. `Smoke & Regression` → `Smoke` + `Regression`).
+3. The `Test Category` value (`Functional`, `API`, or `Negative`).
+4. **Exactly one EPP area tag** from RULE TAG 14 below.
 
 ✅ Example:
 ```
-Gen-AI; AI TestCase; Smoke; Regression; Functional; Resware_OB
+AI TestCase; Smoke; Regression; Functional; Escrow_OB
 ```
 
 ---
