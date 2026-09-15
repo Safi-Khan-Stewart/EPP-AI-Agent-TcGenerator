@@ -2,6 +2,7 @@ import requests
 import sys
 import os
 import base64
+import html
 import urllib.parse
 from datetime import datetime
 import re
@@ -975,61 +976,16 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             })
 
     # ══════════════════════════════════════════════════════════════════════
-    # RULE COV 08 + RULE DATA 09: Data-Driven Coverage
+    # RULE COV 08 + RULE DATA 09: Data-Driven Coverage — DISABLED
     # --------------------------------------------------------------------
-    # SCOPE-AWARE: ``has_data_input`` is now driven by ``scope['allow_data']``,
-    # so this block only fires when the STORY explicitly talks about
-    # data entry / form input / upload / CSV — never just because the
-    # screen happens to have inputs.
+    # Retired 2026-09: generic data-variation test cases (valid / invalid /
+    # empty / special-chars / max-length / min-length) produced noisy,
+    # low-value TCs that duplicated the AC-driven negative case and were
+    # not aligned to any specific field in the story. Data-boundary
+    # coverage is now expected to come from the AC itself (or from a
+    # dedicated data-driven story) rather than being auto-generated.
+    # See LessonsLearned.md → "Generic data-variation TCs".
     # ══════════════════════════════════════════════════════════════════════
-    if has_data_input:
-        actor = roles_found[0]
-        data_variants = [
-            ('valid data', 'Functional', 2,
-             'Submission succeeds; data is saved',
-             'Enter valid values in all required fields'),
-            ('invalid data', 'Negative', 2,
-             'Validation error is displayed; no data is saved',
-             'Enter invalid values (wrong format, out-of-range) in the form'),
-            ('empty/null inputs', 'Negative', 2,
-             'Required-field validation errors are displayed',
-             'Leave all required fields empty'),
-            ('special characters', 'Functional', 3,
-             'Special characters are handled / sanitized correctly',
-             'Enter special characters (!@#$%^&*<>) in text fields'),
-            ('maximum-length values', 'Functional', 3,
-             'Boundary-length value is accepted and saved correctly',
-             'Enter values at the maximum allowed length in each text field'),
-            ('minimum-length values', 'Functional', 3,
-             'Boundary-length value is accepted and saved correctly',
-             'Enter values at the minimum allowed length in each text field'),
-        ]
-        for label, cat, prio, expected, action_step in data_variants:
-            add_tc({
-                'title': f"{feature_label} submission with {label}",
-                'objective': f"Verify that the {feature_label} feature handles {label} correctly and produces the expected outcome without data corruption.",
-                'preconditions': (f"{actor} is logged in; the data entry form is accessible. "
-                                  f"Test data source: CSV (header + valid + invalid + boundary rows + comment column)"),
-                'steps': [
-                    f"Log in to EPP as a {actor}",
-                    f"Navigate to the {feature_label} data entry form",
-                    action_step,
-                    "Click the Submit button",
-                    "Observe the system response",
-                ],
-                'expected': [
-                    f"{actor} is successfully logged in",
-                    "Data entry form is displayed",
-                    "Inputs are entered into the fields as specified",
-                    "Submit action is processed",
-                    expected,
-                ],
-                'overall_expected': expected,
-                'priority': prio,
-                'test_type': 'Regression',
-                'test_category': cat,
-                'ac_ref': f'Data: {label}',
-            })
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE FUNC 10: UI & Field Validation
@@ -1556,6 +1512,13 @@ def _clean_clause(text):
     and must never appear in user-visible test step text."""
     if not text:
         return ''
+    # HTML-decode first so entities like &quot;, &amp;, &nbsp;, &#39;
+    # from ADO-rendered AC text don't leak into titles/steps.
+    try:
+        import html as _html
+        text = _html.unescape(text)
+    except Exception:
+        pass
     t = re.sub(r'\s+', ' ', text).strip()
     t = re.sub(r'^[\-\u2013\u2014\u2022\*\>\s]+', '', t)  # leading dashes/bullets
     t = re.sub(r'^(and|or|that)\b\s+', '', t, flags=re.IGNORECASE)
@@ -1594,16 +1557,50 @@ def _build_condition_phrase(text):
     t = re.sub(r'^(given|when|then|and|but)\s+', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^(verify|validate|ensure|check|confirm)\s+(that\s+)?', '',
                t, flags=re.IGNORECASE)
-    # Drop leading subject words ("the system should", "user will", etc.)
-    t = re.sub(r'^(the\s+)?(system|user|application|page|screen|app)\s+'
-               r'(should|will|must|shall|can)\s+', '', t, flags=re.IGNORECASE)
-    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s+(be\s+)?', '',
+    # Drop leading subject words ("the system should", "user will",
+    # "EPP shall:", "the application must", etc.) INCLUDING product /
+    # component names that behave like a subject in AC prose.
+    t = re.sub(r'^(the\s+)?(system|user|application|page|screen|app|epp|api|service|platform|portal)\s*[:\-]?\s*'
+               r'(should|will|must|shall|can)\s*[:\-]?\s*', '', t, flags=re.IGNORECASE)
+    # Sometimes the AC drops the verb: "EPP: <action>" or "EPP - <action>"
+    t = re.sub(r'^(system|user|application|epp|api|service|platform|portal)\s*[:\-]\s*',
+               '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^(it\s+)?(should|will|must|shall)\s*[:\-]?\s*(be\s+)?', '',
                t, flags=re.IGNORECASE)
     # Drop a leading article so fallback fragments don't read "Feature the X …"
     t = re.sub(r'^(a|an|the)\s+', '', t, flags=re.IGNORECASE)
 
-    # First sentence only
-    t = re.split(r'[.;]\s+', t)[0]
+    # ── 1b. Rewrite implementation-detail assignments into business prose
+    # so titles read like outcomes, not code. Examples handled here:
+    #   "set assignedApproverId = UserId"        → "assigns the approver"
+    #   "set overdraftStatusId = 1"              → "records the overdraft status"
+    #   "update paymentStatus = 'Failed'"        → "updates the payment status"
+    _assign_map = [
+        (r'\b(?:set|assign|update|save|store)\s+assigned?approver\w*\s*=\s*\S+',
+         'assigns the approver'),
+        (r'\b(?:set|assign|update|save|store)\s+overdraft\w*\s*=\s*\S+',
+         'records the overdraft status'),
+        (r'\b(?:set|assign|update|save|store)\s+payment\s*status\w*\s*=\s*\S+',
+         'updates the payment status'),
+        # Generic camelCase assignment fallback — reads the identifier back
+        # as spaced words: "set assignedApproverId = X" → "sets the assigned approver"
+        (r'\b(?:set|assign|update|save|store)\s+([a-z]+(?:[A-Z][a-z]+)+)(?:Id)?\s*=\s*\S+',
+         lambda m: 'sets the ' + re.sub(r'([A-Z])', r' \1', m.group(1)).strip().lower()),
+    ]
+    for pat, repl in _assign_map:
+        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+
+    # First sentence only — split on '.', ';', or on the boundary where
+    # a new imperative clause starts (Capitalised verb like Return / Log
+    # / Prevent / Record). AC prose often chains two imperative sentences
+    # with weak or missing punctuation after a newline collapse, and we
+    # only want the first outcome per test case.
+    _next_clause_verbs = (
+        r'Return|Send|Log|Display|Show|Reject|Notify|Record|Store|'
+        r'Persist|Save|Update|Trigger|Emit|Raise|Prevent|Block|Allow|'
+        r'Ensure|Set|Assign|Create|Delete|Remove|Add|Include|Exclude'
+    )
+    t = re.split(r'[.;]\s+|(?<=[a-z])\s+(?=(?:' + _next_clause_verbs + r')\b)', t)[0]
     # Compound clauses joined by " and " — keep only the first outcome
     # so titles don't try to stuff two verbs in (e.g.
     # "is created and a confirmation is shown" → "is created").
@@ -1713,22 +1710,58 @@ def _build_condition_phrase(text):
 _TRAILING_FUNC_WORDS = frozenset({
     'a', 'an', 'the', 'in', 'on', 'of', 'to', 'for', 'with', 'from',
     'by', 'at', 'as', 'and', 'or', 'but', 'into', 'onto', 'over',
-    'under', 'between', 'within', 'inside',
+    'under', 'between', 'within', 'inside', 'via', 'per',
+})
+
+# Transitive verbs / auxiliaries that read as fragments when they are
+# the very last word of a title (their object was clipped). Titles must
+# never end on one of these.
+_TRAILING_DANGLING_VERBS = frozenset({
+    'contain', 'contains', 'include', 'includes', 'have', 'has',
+    'be', 'is', 'are', 'was', 'were', 'do', 'does', 'did',
+    'point', 'points', 'refer', 'refers', 'match', 'matches',
+    'equal', 'equals', 'set', 'sets', 'get', 'gets', 'use', 'uses',
+    'send', 'sends', 'return', 'returns', 'update', 'updates',
+    'show', 'shows', 'display', 'displays', 'call', 'calls',
+    'should', 'shall', 'will', 'must', 'may', 'can',
+    'not',  # never end on a bare negation
 })
 
 
 def _clip_words(text: str, max_words: int = 8) -> str:
     """Clip ``text`` to at most ``max_words`` words and strip any trailing
-    function word so the fragment ends on a content word."""
+    function word, dangling operator (``=``, ``:``, ``->``) or lone
+    identifier so the fragment ends on a real content word."""
     words = (text or '').strip().split()
     if not words:
         return ''
     if len(words) > max_words:
         words = words[:max_words]
-    # Strip trailing function words / punctuation
-    while words and words[-1].lower().strip(',;:.-') in _TRAILING_FUNC_WORDS:
+
+    def _is_junk_tail(w: str) -> bool:
+        wl = w.lower().strip(',;:.-')
+        if not wl:
+            return True
+        if wl in _TRAILING_FUNC_WORDS:
+            return True
+        # Transitive verbs / auxiliaries that MUST have an object after
+        # them — if they end up as the last word of a title, the object
+        # was clipped and the title reads as a fragment.
+        if wl in _TRAILING_DANGLING_VERBS:
+            return True
+        # Dangling assignment / operator / punctuation
+        if w.rstrip(',;:.').endswith(('=', ':', '->', '=>', '<-', '<=', '>=')):
+            return True
+        # A trailing camelCase identifier fragment (e.g. "assignedApproverId")
+        # left over after we clipped an assignment — it reads as noise in a
+        # title. Drop it if it's a single mixed-case token with no spaces.
+        if re.match(r'^[a-z]+[A-Z][A-Za-z0-9]*Id$', w):
+            return True
+        return False
+
+    while words and _is_junk_tail(words[-1]):
         words.pop()
-    return ' '.join(words).rstrip(',;:- ')
+    return ' '.join(words).rstrip(',;:- =')
 
 
 def _titlecase_phrase(phrase: str) -> str:
@@ -1886,19 +1919,135 @@ def _normalize_title(t):
     t = re.sub(r'\s+', ' ', t or '').strip()
     t = re.sub(r'\bthat\b\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[\-\u2013\u2014\s]+', '', t)
-    t = t.rstrip(' .:;,-\u2013\u2014')
+    t = t.rstrip(' .:;,-\u2013\u2014=')
+    # Drop dangling assignment operators / lone identifier fragments left
+    # behind by clipped AC prose (e.g. "… Set assignedApproverId =").
+    t = re.sub(r'\s+(?:set|assign|update|save)\s+\w+\s*=\s*$', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s+\w+Id\s*=?\s*$', '', t)
     if not t.lower().startswith('verify'):
         t = 'Verify ' + t
     t = re.sub(r'\s+', ' ', t).strip()
     if len(t) > 90:
         cut = t[:90].rsplit(' ', 1)[0]
-        # Drop any trailing function words so the title still parses
+        # Drop any trailing function words / dangling verbs so the title
+        # still parses as a complete clause.
         words = cut.split(' ')
-        while words and words[-1].lower().strip(',;:.-') in _TRAILING_FUNC_WORDS:
+        while words and (words[-1].lower().strip(',;:.-') in _TRAILING_FUNC_WORDS
+                         or words[-1].lower().strip(',;:.-') in _TRAILING_DANGLING_VERBS):
             words.pop()
         cut = ' '.join(words).rstrip(',;:- ')
         t = cut if cut else t[:90]
+    # Final safety pass — even under 90 chars, never end on a dangling
+    # transitive verb ("… should not contain", "… link should point to").
+    words = t.split(' ')
+    while len(words) > 3 and words[-1].lower().strip(',;:.-') in _TRAILING_DANGLING_VERBS:
+        words.pop()
+    t = ' '.join(words).rstrip(',;:- ')
     return t
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LESSONS-LEARNED GUARDRAILS
+# --------------------------------------------------------------------------
+# Every generated test case is passed through `_apply_lessons_learned`
+# before it is shown to the user or pushed to ADO. The function encodes
+# the concrete rules distilled from LessonsLearned.md, so any new lesson
+# added there should also be reflected here (or covered by the existing
+# helpers it calls). Loading + hashing the file is done once per run and
+# printed during phase 4 so the user can see which lessons are active.
+# ══════════════════════════════════════════════════════════════════════════
+
+_LESSONS_CACHE = {'path': None, 'mtime': 0, 'headings': [], 'raw': ''}
+
+
+def _load_lessons_learned():
+    """Load `LessonsLearned.md` from the repo root (or `test/`). Returns a
+    dict with the raw text and the ordered list of `###` headings so the
+    generator can print which lessons are being enforced this run."""
+    global _LESSONS_CACHE
+    candidates = [
+        os.path.join(os.path.dirname(__file__), '..', 'LessonsLearned.md'),
+        os.path.join(os.path.dirname(__file__), 'LessonsLearned.md'),
+        os.path.join(os.getcwd(), 'LessonsLearned.md'),
+    ]
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    if not path:
+        return {'raw': '', 'headings': [], 'path': None}
+    try:
+        mtime = os.path.getmtime(path)
+        if _LESSONS_CACHE.get('path') == path and _LESSONS_CACHE.get('mtime') == mtime:
+            return _LESSONS_CACHE
+        with open(path, 'r', encoding='utf-8') as fh:
+            raw = fh.read()
+        headings = re.findall(r'^###\s+\d*\.?\s*(.+?)\s*$', raw, flags=re.MULTILINE)
+        _LESSONS_CACHE = {'path': path, 'mtime': mtime,
+                          'headings': headings, 'raw': raw}
+        return _LESSONS_CACHE
+    except Exception:
+        return {'raw': '', 'headings': [], 'path': None}
+
+
+def _apply_lessons_learned(tc: dict) -> dict:
+    """Post-process a test case dict against the guardrails distilled from
+    `LessonsLearned.md`. This is the single choke-point where every new
+    test case is scrubbed before it can reach the review page or ADO.
+
+    Current guardrails (keep aligned with LessonsLearned.md):
+
+    * **Lesson 1 — no generic data-variation TCs.**
+      Drop any TC whose `ac_ref` starts with `Data:` (defence-in-depth
+      even though the generator no longer emits them).
+    * **Lesson 2 — no leaked AC subject prefixes or trailing operators
+      in the title.** Re-normalize the title, strip inline
+      `EPP shall/sends/must` fragments that survived the condition
+      builder, and drop dangling `=` / `Id` operators.
+    * **Lesson 4 — no dangling transitive verbs at the end of a title.**
+      Handled by `_normalize_title`, re-applied here for safety.
+    * **Lesson 5 — no HTML entities.** `html.unescape` every user-facing
+      string (title, objective, preconditions, steps, expected).
+    """
+    if not tc:
+        return tc
+
+    # Lesson 1 — drop retired data-variation TCs if any slip through.
+    if str(tc.get('ac_ref', '')).lower().startswith('data:'):
+        return None  # type: ignore[return-value]
+
+    def _decode(s):
+        if not isinstance(s, str):
+            return s
+        try:
+            return html.unescape(s)
+        except Exception:
+            return s
+
+    # HTML-decode every user-facing field (Lesson 5).
+    for k in ('title', 'objective', 'preconditions', 'overall_expected'):
+        if k in tc:
+            tc[k] = _decode(tc[k])
+    for k in ('steps', 'expected'):
+        val = tc.get(k)
+        if isinstance(val, list):
+            tc[k] = [_decode(x) for x in val]
+        elif isinstance(val, str):
+            tc[k] = _decode(val)
+
+    # Lesson 2 — strip inline AC subject leaks the condition builder missed
+    # (e.g. "Extended Payload EPP sends the new"). Only remove when the
+    # subject sits between the feature label and a modal/action verb.
+    title = tc.get('title', '') or ''
+    title = re.sub(
+        r'\s+(?:EPP|API|Service|Platform|Portal|System)\s+'
+        r'(?=(?:shall|will|must|should|can|sends?|returns?|records?|'
+        r'displays?|shows?|updates?|creates?|deletes?|validates?|'
+        r'processes?|assigns?|prevents?|allows?|blocks?)\b)',
+        ' ', title, flags=re.IGNORECASE)
+    # Also strip a trailing "= <value>" or "<Word>Id" that survived clipping.
+    title = re.sub(r'\s+\w+\s*=\s*\S*$', '', title)
+    title = re.sub(r'\s+\w+Id\s*$', '', title)
+    tc['title'] = _normalize_title(title)  # Lesson 4 dangling-verb sweep
+
+    return tc
 
 
 def _infer_application_module(combined):
@@ -2530,11 +2679,41 @@ def generate_and_push_test_cases(story_id):
     # ── PHASE 4/5 ── Generate test cases from AC + scope + domain + history
     _phase("\n[4/5] Generating test cases from Acceptance Criteria "
            "(scope-strict, RULE SCOPE 16)…")
+
+    # Load the LessonsLearned.md guardrails so every TC is scrubbed
+    # against the known-bad patterns before it reaches the user.
+    lessons = _load_lessons_learned()
+    if lessons.get('headings'):
+        print(f"      Guardrails : {len(lessons['headings'])} lesson(s) "
+              f"active from LessonsLearned.md", flush=True)
+        for h in lessons['headings'][:6]:
+            print(f"                   • {h}")
+        if len(lessons['headings']) > 6:
+            print(f"                   … (+{len(lessons['headings'])-6} more)")
+    else:
+        print("      Guardrails : LessonsLearned.md not found — "
+              "using built-in defaults only", flush=True)
+
     test_cases_raw, ac_clean, desc_clean, _ = \
         generate_test_cases_from_acceptance_criteria(work_item, history=history_ctx)
     if not test_cases_raw:
         print("WARNING: No test cases could be generated.")
         return
+
+    # Apply lessons-learned scrubber (drops nulls, cleans titles, decodes
+    # HTML entities). Any TC returning None is filtered out.
+    scrubbed = []
+    dropped = 0
+    for tc in test_cases_raw:
+        cleaned = _apply_lessons_learned(tc)
+        if cleaned is None:
+            dropped += 1
+            continue
+        scrubbed.append(cleaned)
+    test_cases_raw = scrubbed
+    if dropped:
+        print(f"      Dropped    : {dropped} TC(s) blocked by lessons-learned "
+              f"guardrails", flush=True)
 
     print(f"      Generated  : {len(test_cases_raw)} test case(s)", flush=True)
     for i, tc in enumerate(test_cases_raw, 1):
