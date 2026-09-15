@@ -216,14 +216,14 @@ Before generating test cases for a new User Story, the AI must:
 ### RULE TAG 13: Mandatory Test Case Tags
 Every test case pushed to ADO **must** carry the following tags in `System.Tags` (semicolon-separated):
 
-1. `AI TestCase` — mandatory generator/origin tag (replaces the older `AI Test Case Generator` and the previously-used `Gen-AI` marker).
+1. `AI Test Case` — mandatory generator/origin tag (replaces the older `AI TestCase`, `AI Test Case Generator`, and the previously-used `Gen-AI` marker).
 2. The `Test Type` value (split into one tag per word when combined, e.g. `Smoke & Regression` → `Smoke` + `Regression`).
 3. The `Test Category` value (`Functional`, `API`, or `Negative`).
 4. **Exactly one EPP area tag** from RULE TAG 14 below.
 
 ✅ Example:
 ```
-AI TestCase; Smoke; Regression; Functional; Escrow_OB
+AI Test Case; Smoke; Regression; Functional; Escrow_OB
 ```
 
 ---
@@ -245,7 +245,7 @@ Pick exactly **one** tag based on the User Story's portal and feature area. Rule
 ✅ **Implementation reference:** `test/domain_context.py → classify_epp_area()` performs this classification automatically from the User Story's title, description, and acceptance criteria.
 
 ✅ **Filtering tip in ADO:** because the tag is on `System.Tags`, you can run queries like  
-`Tags Contains "Resware_OB" AND Tags Contains "AI TestCase"` to see all AI-generated outbound-Escrow test cases.
+`Tags Contains "Resware_OB" AND Tags Contains "AI Test Case"` to see all AI-generated outbound-Escrow test cases.
 
 ---
 

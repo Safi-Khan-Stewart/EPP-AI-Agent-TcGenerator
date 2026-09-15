@@ -1651,3 +1651,203 @@ The "My Payments" tab is only shown to `FieldUser` in the navigation, but the un
 **Document prepared by:** GitHub Copilot  
 **Based on:** Full codebase analysis of `Epp.Escrow.Admin` and `Epp.Admin` projects  
 **Source of truth:** Actual TypeScript/C# source code — no assumptions made
+
+
+---
+
+# 📦 Business Domain — Source-Code Derived
+
+*Auto-generated 2026-09-15 by `test/_probe_repo_domain.py` from the following Azure DevOps repositories in `StewartTitle/Enterprise Payments`.*
+
+This section is a **fact-based snapshot** of the code base (controllers, routes, DTOs, enums, README summaries). It is meant as an evidence layer supporting the human-authored business documentation above, not a replacement for it.
+
+## Bounded Contexts
+
+| Bounded Context | Repositories |
+|---|---|
+| **Administration Portal** | `Epp.Admin` |
+| **Core Platform API** | `Epp.Api` |
+| **Escrow Administration** | `Epp.Escrow.Admin` |
+| **Escrow Customer Experience** | `Epp.Escrow.Customer` |
+| **Escrow Operations API** | `Epp.Api.Escrow.Operations` |
+| **Parties Onboarding** | `Epp.Parties.Onboarding` |
+| **Parties Payment** | `Epp.Parties.Payment` |
+| **Parties Profile** | `Epp.Parties.Profile` |
+
+## Administration Portal
+
+### `Epp.Admin`
+
+- **Files scanned:** 573
+- **Projects (`*.csproj`):** `Epp.Admin`, `Epp.Admin.Shared`
+- **Root namespaces:** `Epp.Admin.Api`, `Epp.Admin.Projections.Api`, `Epp.Admin.Projections.Api.Models`, `Epp.Admin.Webhooks.Api`
+- **Controllers (42):** `AccountController`, `AccountingRequestProjectionController`, `BulkPaymentProjectionController`, `BulkPaymentsController`, `BusinessUnitAccountController`, `BusinessUnitController`, `BusinessUnitPaymentAccountController`, `FundingRequestController`, `FundingRequstProjectionController`, `FundsDisbursementController`, `FundsDisbursementProjectionController`, `FundsTransferController`, `FundsTransferProjectionController`, `KnownConnectedSystemController`, `MetricsController`, `OnboardingTokenAssociationController`, `OnboardingTokenController`, `OperationsController`, `PartyAccountController`, `PartyConnectedSystemAssociationController`, `PartyController`, `PartyProjectionController`, `PartyUserAccessTokenController`, `PartyUserConnectedSystemAssociationController`, `PartyUserController`
+- **Base routes:** `api/Accounts`, `api/Accounts/Stripe`, `api/Accounts/Stripe/Actions`, `api/FundingRequest/Stripe`, `api/FundingRequests`, `api/FundsDisbursements`, `api/FundsTransfers`, `api/Onboarding/Token`, `api/Onboarding/TokenAssociation`, `api/Operations/BusinessUnits`, `api/Operations/KnownConnectedSystem`, `api/Parties`, `api/Parties/Accounts`, `api/Parties/ConnectedSystemAssociations`, `api/Parties/UserAssociations`
+- **Sample HTTP endpoints (40):**
+
+  ```
+  DELETE BusinessUnits/{businessUnitKey:guid}/AssociatedUsers
+  DELETE {partyKey:Guid}
+  GET
+  GET AccountService/{stripeReference}
+  GET AccountService/{stripeReference}/PaymentAccounts
+  GET BusinessUnits
+  GET BusinessUnits/{businessUnitKey:guid}
+  GET BusinessUnits/{businessUnitKey:guid}/AssociatedUsers
+  GET Party/{partyKey:guid}
+  GET Payment/ActiveRequests
+  GET Payment/RequestsDetails
+  GET PayoutPeriod
+  GET PersonService/{stripeReference}
+  GET Search
+  GET {accountKey:Guid}
+  GET {accountingRequestKey:guid}
+  GET {businessUnitKey:guid}/Accounts
+  GET {businessUnitKey:guid}/PaymentAccounts
+  GET {fundingRequestKey:Guid}
+  GET {fundsDisbursementKey:Guid}
+  ```
+
+## Core Platform API
+
+### `Epp.Api`
+
+- **Files scanned:** 5087
+- **Projects (`*.csproj`):** `Epp.Api`, `Epp.Api.AccountChek`, `Epp.Api.AccountChek.Tests`, `Epp.Api.Accounting`, `Epp.Api.Accounting.Tests`, `Epp.Api.Accounts`, `Epp.Api.Accounts.Tests`, `Epp.Api.Aggregate.Data`, `Epp.Api.Aggregate.Data.Tests`, `Epp.Api.Analyzers`, `Epp.Api.Analyzers.Tests`, `Epp.Api.BankAccounts`, `Epp.Api.BankAccounts.Tests`, `Epp.Api.Branding`, `Epp.Api.Branding.Tests`, `Epp.Api.Documents`, `Epp.Api.Documents.Tests`, `Epp.Api.Escrow`, `Epp.Api.Escrow.Tests`, `Epp.Api.Integration.Elis`
+- **Root namespaces:** `Epp.Api.AccountChek.Api`, `Epp.Api.AccountChek.Api.Models`, `Epp.Api.AccountChek.Domain`, `Epp.Api.AccountChek.Messages`, `Epp.Api.Accounting.Party.Api`, `Epp.Api.Accounts.Api`, `Epp.Api.Accounts.Api.Models`, `Epp.Api.Accounts.Domain`
+- **Controllers (18):** `AccountChekController`, `AccountChekWebhookController`, `AccountController`, `AccountingVendorController`, `BankAccountController`, `BankController`, `EscrowOfficeController`, `EscrowUserController`, `InternalBankAccountController`, `InternalBankAccountExternalAssociationController`, `anonymouscontroller`, `anonymouswithauthorizemethodcontroller`, `limitedauthorization2controller`, `limitedauthorizationcontroller`, `limitedauthorizationwithcustomcontroller`, `limitedauthorizationwithlatecontroller`, `missingauthorizationcontroller`, `simplecontroller`
+- **Base routes:** `AccountChek`, `Accounting`, `Accounts`, `BankAccounts`, `Banks`, `EscrowOffices`, `InternalBankAccounts`, `Users`
+- **Sample HTTP endpoints (1):**
+
+  ```
+  POST Webhook
+  ```
+- **DTO / Model / Command / Query types (15):** `AccountEntity`, `AccountProviderModel`, `BankAccountEntity`, `BankAccountStatusEntity`, `BankEntity`, `BankPaymentRailCutoffTimeEntity`, `BankSettingsEntity`, `CreateAccountChekOrderModel`, `EscrowOfficeEntity`, `EscrowOfficeInternalBankAccountAssociationModel`, `InternalBankAccountPaymentRailModel`, `InternalBankAccountRoutingNumberModel`, `InternalBankAccountRoutingNumberPaymentRailModel`, `OrderEntity`, `RemoveInternalBankAccountExternalAssociationModel`
+- **`docs/` narrative (12 file(s)):**
+
+  > */docs/epp-api-interop.md* — The shared contract library for exchanging EPP events with external ("connected") systems over Azure Service Bus. > The original interoperability prototype — the `Epp.Api.Interop.Hosting` wiring and the > `Epp.Api.Interop.Sender` / `Epp.Api.Interop.Receiver` consoles — has been removed. The production > design that supersedes it lives in > `docs/superpowers/specs/2026-08-27-servicebus-event-delivery-design.md`. MassTransit **8.5.10**, the newest release under the free Apache-2.0 licence. Version 9 and later are under MassTransit's commercial licence and are deliberately not used here. ## Projects | Project | What it is | | --- | --- | | `Epp.Api.Interop.Messages` | The shared contract library. Interfaces, concrete records, versioning rules, the JSON and protobuf wire formats, and the gener
+
+  > */docs/epp-interop-steps-handoff.md* — How EPP streams escrow payment events to a connected system's Azure Service Bus topic, what the consuming team (STEPS) has to implement, what DevOps has to configure, and how to switch it on. Design: `docs/superpowers/specs/2026-08-27-servicebus-event-delivery-design.md`. Contract library details (envelope, versioning, `.proto`): `docs/epp-api-interop.md`. Event streaming is **additive**: webhooks continue unchanged for every connected system. A system receives Service Bus events only while it has an enabled registry row. ## The wire contract (what STEPS consumes) Each message on the topic is a bare payload — no MassTransit envelope: - **Body**: the `EppMessage` envelope (`emittedAt`, `messageId`, `type`, `version`, `body`), encoded per the system's configured format — JSON (camelCase, mon
+
+  > */docs/superpowers/plans/2026-07-09-payment-intent-audit-endpoint.md* — > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Goal:** Add `GET /Escrow/Payments/Intents/{escrowPaymentIntentKey}/Audit` returning the Activity Log contract (`GetEscrowPaymentIntentAuditResponse`), fed from the existing `EscrowPaymentAttemptHistory` rows across all attempts under the intent. **Architecture:** Three layers. **Data:** one multi-result query (`GetAudit`) on `IReadonlyEscrowPaymentIntentRepository` pulls everything per intent key via Dapper `QueryMultiple`/`result.Read<>()` into a new `EscrowPaymentIntentAuditAggregate` — attempt history is the first of several result sets; future sources (intent statu
+
+  > */docs/superpowers/plans/2026-07-09-payment-intent-audit-manual-actions.md* — > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Goal:** Surface the 8 manual actions (Claim, Resolve, Rejection, Posted, FailureReport, Reversal, Release, OfacDetails) as `Intent*` rows in `GET /Escrow/Payments/Intents/{key}/Audit`. **Architecture:** Read-side only. `GetAudit`'s multi-result SQL gains result sets 4–12 (the manual-action side tables + a `RelevantUsers` CTE over `EscrowUser`), duplicated/adapted from `GetExtras`. The aggregate carries them; `ExternalApplicationService.GetEscrowPaymentIntentAudit` maps them through one shared `MapManualActionAuditItem` helper into the same `items` list before the exist
+
+  > */docs/superpowers/plans/2026-07-09-payment-intent-audit-overnight-queue.md* — > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Goal:** Surface Overnight Queue entry/exit as derived `AttemptQueuedEnter`/`AttemptQueuedExit` rows in `GET /Escrow/Payments/Intents/{key}/Audit`. **Architecture:** Read-side only, derived from `EscrowPaymentAttempt.ReleaseDate` (no queue event table). `GetAudit` gains result set 13 (queued attempts, `ReleaseDate IS NOT NULL`, hydrated into a slim 3-field `EscrowPaymentAttemptQueueValueObject`); the service emits an entry row per queued attempt (`ReceivedAt = CreatedAt`) and an exit row only once `ReleaseDate < DateTimeOffset.UtcNow` (`ReceivedAt = ReleaseDate`), both 
+
+## Escrow Administration
+
+### `Epp.Escrow.Admin`
+
+- **Files scanned:** 704
+- **Projects (`*.csproj`):** `Epp.Escrow.Admin`, `Epp.Escrow.Admin.Shared`
+- **Root namespaces:** `Epp.Escrow.Admin.AiSearch.Api`, `Epp.Escrow.Admin.AiSearch.Application.Models`, `Epp.Escrow.Admin.Api`, `Epp.Escrow.Admin.Api.Names`, `Epp.Escrow.Admin.Services`
+- **Controllers (26):** `AiSearchIndexController`, `BankAccountController`, `BankController`, `CustomerOnboardingTokenController`, `EscrowIncomingPaymentsController`, `EscrowOfficeController`, `EscrowOperationsPaymentController`, `EscrowPaymentAggregateController`, `EscrowPaymentAggregatePartySettingsController`, `EscrowPaymentAggregateProjectionController`, `EscrowPaymentProjectionController`, `EscrowPaymentsController`, `ExpectedPaymentsProjectionController`, `InternalBankAccountController`, `InternalBankAccountExternalAssociationController`, `ModernTreasuryInternalAccountController`, `NamesController`, `PartyConnectedSystemAssociationController`, `PartyProjectionController`, `PaymentIntegrationController`, `PaymentRequestController`, `PreferencesController`, `SettingsController`, `TaskController`, `TransacteeController`
+- **Base routes:** `api/BankAccounts`, `api/Banks`, `api/Escrow/Onboarding/Token`, `api/Escrow/PaymentRequest`, `api/Escrow/Payments`, `api/Escrow/Payments/Aggregate`, `api/Escrow/Payments/Aggregate/PartySettings`, `api/Escrow/Payments/Expected/Incoming`, `api/EscrowOffices`, `api/Index`, `api/InternalBankAccounts`, `api/InternalBankAccounts/ModernTreasury`, `api/Parties/ConnectedSystem`, `api/Projections/EscrowPaymentAggregates`, `api/Projections/EscrowPayments`
+- **DTO / Model / Command / Query types (1):** `EscrowPaymentTypes`
+
+## Escrow Customer Experience
+
+### `Epp.Escrow.Customer`
+
+- **Files scanned:** 725
+- **Projects (`*.csproj`):** `Epp.Escrow.Customer.Api`, `Epp.Escrow.Customer.Onboarding`, `Epp.Escrow.Customer.Payment`, `Epp.Escrow.Customer.Profile`, `Epp.Escrow.Customer.Public`, `Epp.Escrow.Customer.Shared`
+- **Root namespaces:** `Epp.Escrow.Customer.Onboarding.Api`, `Epp.Escrow.Customer.Payment.Api`, `Epp.Escrow.Customer.Profile.Api`, `Epp.Escrow.Customer.Public.Api`
+- **Controllers (24):** `BankController`, `CustomerOnboardingTokenController`, `CustomerOnboardingTokenController`, `EscrowOfficeController`, `EscrowPaymentProjectionController`, `InternalBankAccountController`, `OnboardingSettingsController`, `PartyBankAccountController`, `PartyConnectedSystemAssociationController`, `PartyProjectionController`, `PaymentProfileController`, `PaymentRequestController`, `PaymentRequestController`, `PaymentSettingsController`, `PaymentsController`, `ProfileBankController`, `ProfileSettingsController`, `ProfileTransactionRouterController`, `PublicSettingsController`, `TestIdentityController`, `TokenExController`, `TransactionRouterController`, `VerificationAddressController`, `VerificationTwilioController`
+- **Base routes:** `Onboarding/Api/Address`, `Onboarding/Api/Banks`, `Onboarding/Api/Escrow/Onboarding/Token`, `Onboarding/Api/Escrow/PaymentRequest`, `Onboarding/Api/Parties/ConnectedSystem`, `Onboarding/Api/Settings`, `Onboarding/Api/TokenEx`, `Onboarding/Api/TransactionRouter`, `Onboarding/Api/Verification/Twilio`, `Payment/Api/Escrow/Payments`, `Payment/Api/InternalBankAccount`, `Payment/Api/Parties/PaymentProfile`, `Payment/Api/Settings`, `Profile/Api/Parties/BankAccounts`, `Profile/Api/Projection/Party`
+
+## Escrow Operations API
+
+### `Epp.Api.Escrow.Operations`
+
+- **Files scanned:** 254
+- **Projects (`*.csproj`):** `Epp.Api.Escrow.Operations`, `Epp.Api.Escrow.Operations.Integration`, `Epp.Api.Escrow.Operations.ServiceClient`, `Epp.Api.Escrow.Operations.Shared`, `Epp.Api.Escrow.Operations.Tests`
+- **Root namespaces:** `Epp.Api.Escrow.Operations.Accounts.Api`, `Epp.Api.Escrow.Operations.Accounts.Api.Models`, `Epp.Api.Escrow.Operations.Accounts.Application.Models`, `Epp.Api.Escrow.Operations.Integration.Services.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Api`, `Epp.Api.Escrow.Operations.PaymentRequest.Api.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Application.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Data`
+- **Controllers (4):** `AccountsController`, `ApproversController`, `ManagerQueueController`, `PaymentsController`
+- **Base routes:** `api/accounts`, `api/approvers`, `api/payments`, `api/payments/manager-queue`
+- **DTO / Model / Command / Query types (12):** `CreateConsolidatedPaymentServiceModel`, `CreateFilePaymentServiceModel`, `CreatePaymentRequestServiceModel`, `EligibleApproverServiceModel`, `GetEligibleApproversServiceModel`, `InboundPaymentDto`, `OutboundPaymentDto`, `PaymentApprovalDto`, `PaymentRequestEntity`, `PaymentStatusServiceModel`, `UserApprovalLevels`, `UserEntity`
+- **Domain enums:** `PaymentApprovalStatus`, `PaymentApprovalType`, `PaymentRequestStatus`, `PaymentType`
+
+## Parties Onboarding
+
+### `Epp.Parties.Onboarding`
+
+- **Files scanned:** 420
+- **Projects (`*.csproj`):** `Epp.Parties.Onboarding`, `Epp.Parties.Onboarding.Shared`
+- **Root namespaces:** `Epp.Parties.Onboarding.Api`
+- **Controllers (13):** `AccountingController`, `BankController`, `BrandingSettingsController`, `IntegrationElisController`, `OnboardingTokenController`, `PartyConnectedSystemAssociationController`, `PartyController`, `PartyUserAccsessTokenController`, `PartyUserConnectedSystemAssociationController`, `SessionController`, `SettingsController`, `VerificationController`, `VerificationTokenController`
+- **Base routes:** `api/Accounting`, `api/Banks`, `api/BrandingSettings`, `api/Integration/Elis`, `api/Onboarding`, `api/Parties`, `api/Parties/Users`, `api/PartyUserAccessTokens`, `api/Session`, `api/Settings`, `api/Verification`, `api/VerificationToken`
+- **Sample HTTP endpoints (16):**
+
+  ```
+  GET ConnectedSystem/{connectedSystemKey:guid}/Identifier/{connectedSystemPartyIdentifier}
+  GET ConnectedSystem/{connectedSystemKey:guid}/Identifier/{connectedSystemPartyUserIdentifier}
+  GET Search
+  GET {connectedSystemKey:Guid}/{businessUnitKey:Guid}
+  GET {connectedSystemKey:guid}
+  GET {onboardingTokenKey:Guid}
+  GET {partyKey:Guid}/Full
+  GET {partyKey:Guid}/Locations/{partyLocationKey:Guid}
+  GET {partyUserAccessTokenKey:guid}
+  GET {verificationTokenKey:guid}/{referenceKey}
+  POST
+  POST VendorDuplicateChecks
+  POST Verify
+  POST {onboardingTokenKey:Guid}/Completion
+  POST {onboardingTokenKey:Guid}/OnHold
+  PUT {onboardingTokenKey:Guid}/Audit
+  ```
+
+## Parties Payment
+
+### `Epp.Parties.Payment`
+
+- **Files scanned:** 2
+- **README excerpt:**
+
+  > */README.md* — TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. # Getting Started TODO: Guide users through getting your code up and running on their own system. In this section you can talk about: 1. Installation process 2. Software dependencies 3. Latest releases 4. API references # Build and Test TODO: Describe and show how to build your code and run the tests. # Contribute TODO: Explain how other users and developers can contribute to make your code better. If you want to learn more about creating good readme files then refer 
+
+## Parties Profile
+
+### `Epp.Parties.Profile`
+
+- **Files scanned:** 384
+- **Projects (`*.csproj`):** `Epp.Parties.Profile`, `Epp.Parties.Profile.Shared`
+- **Root namespaces:** `Epp.Parties.Profile.Api`
+- **Controllers (17):** `AccountController`, `AccountingController`, `BankController`, `IntegrationElisController`, `OnboardingTokenController`, `PartyAccountController`, `PartyController`, `PartyLocationController`, `PartyUserAccessTokenController`, `PartyUserController`, `PartyUserPartyAssociationController`, `PaymentFlowEnabledAccountController`, `SettingsController`, `StripeAccountController`, `StripeController`, `VerificationController`, `VerificationTokenController`
+- **Base routes:** `api/Accounting`, `api/Accounts`, `api/Accounts/Stripe`, `api/Banks`, `api/Integration/Elis`, `api/Onboarding`, `api/Parties`, `api/Parties/Accounts`, `api/Parties/PartyUser/Token`, `api/Parties/UserAssociations`, `api/Parties/Users`, `api/PaymentFlowEnabledAccounts`, `api/Settings`, `api/Stripe`, `api/Verification`
+- **Sample HTTP endpoints (36):**
+
+  ```
+  DELETE {partyKey:Guid}/Locations/{partyLocationKey:guid}
+  DELETE {partyKey:Guid}/Users/{partyUserKey:Guid}/Reset
+  GET
+  GET AccountService/{stripeReference}
+  GET ByPartyKey/{partyKey:guid}
+  GET Integration/Elis/{onboardingTokenKey:guid}
+  GET Party/{partyKey:guid}
+  GET PersonService/{stripeReference}
+  GET Search
+  GET {accountKey:Guid}
+  GET {partyKey:Guid}
+  GET {partyKey:Guid}/Contact
+  GET {partyKey:Guid}/Locations
+  GET {partyKey:Guid}/Locations/{partyLocationKey:Guid}
+  GET {partyKey:Guid}/PaymentOptions
+  GET {partyKey:Guid}/Preferences
+  GET {partyKey:Guid}/Users
+  GET {partyUserAccessToken:Guid}
+  GET {partyUserAccessToken:Guid}/Validate
+  GET {partyUserKey:Guid}
+  ```
+- **README excerpt:**
+
+  > */Epp.Parties.Profile/ClientApp/README.md* — This project was generated with [Angular CLI](https://github.com/angular/angular-cli) version 12.0.2. ## Development server Run `ng serve` for a dev server. Navigate to `http://localhost:4200/`. The app will automatically reload if you change any of the source files. ## Code scaffolding Run `ng generate component component-name` to generate a new component. You can also use `ng generate directive|pipe|service|class|guard|interface|enum|module`. ## Build Run `ng build` to build the project. The build artifacts will be stored in the `dist/` directory. ## Running unit tests Run `npm run test` to 
+
+  > */Epp.Parties.Profile/ClientApp/src/epp-core/README.md* — Source shared with the sibling EPP front-ends (`Epp.Parties.Profile`, `Epp.Parties.Onboarding`); ported from `epp-core-customer` in the `Epp.Escrow.Customer` workspace. ## Status: vendored source, destined to become an npm package This folder is a **placeholder for the `@epp/core` npm package**. Until that package exists, the code is vendored here and resolved through a path alias, so consumers already import it by its future package name: ```ts import { BankNameHintComponent, CachedBankApiService } from '@epp/core'; ``` | Now | Later | |-----|-------| | `tsconfig.json` → `"@epp/core": ["./src
+
+---
+
+### How to refresh
+
+Re-run `python test/_probe_repo_domain.py`. The probe replaces the section between the `# 📦 Business Domain — Source-Code Derived` heading and end-of-file so the human-authored content above is preserved.

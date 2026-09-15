@@ -571,6 +571,100 @@ def get_work_item_full_details(work_item_id):
         print(f"Error fetching work item {work_item_id}: {e}")
         return None
 
+def _fetch_related_story_context(work_item_id: int, area_path: str,
+                                 max_items: int = 6) -> dict:
+    """Pull context from Parent Feature + Related work items + recent
+    stories in the same Area Path so the generator understands the
+    *module history* around the current story.
+
+    Returns
+    -------
+    dict with keys:
+      ``related_blob`` : str   concatenated Description + AC text
+                               (lower-cased) from related items,
+                               capped for safety.
+      ``related_ids``  : list  IDs actually pulled (for logging).
+      ``related_titles`` : list  titles for reviewer transparency.
+
+    Failures are swallowed silently — related context is a *booster*,
+    never a hard dependency.
+    """
+    related_ids: list = []
+    related_titles: list = []
+    blobs: list = []
+
+    # 1. Parent Feature + Related links from the current work item
+    try:
+        for link in get_linked_items(work_item_id) or []:
+            attrs = link.get('attributes', {}) or {}
+            name = (attrs.get('name') or '').lower()
+            if name not in ('parent', 'related', 'child'):
+                continue
+            try:
+                rid = int(str(link.get('url', '')).rsplit('/', 1)[-1])
+            except Exception:
+                continue
+            if rid and rid != work_item_id and rid not in related_ids:
+                related_ids.append(rid)
+            if len(related_ids) >= max_items:
+                break
+    except Exception:
+        pass
+
+    # 2. Recent stories in the same Area Path (module history)
+    if area_path and len(related_ids) < max_items:
+        try:
+            wiql = {
+                "query": (
+                    "SELECT [System.Id] FROM WorkItems WHERE "
+                    "[System.WorkItemType] = 'User Story' AND "
+                    f"[System.AreaPath] UNDER '{area_path}' AND "
+                    f"[System.Id] <> {work_item_id} "
+                    "ORDER BY [System.ChangedDate] DESC"
+                )
+            }
+            org = urllib.parse.quote(ADO_ORG)
+            project = urllib.parse.quote(ADO_PROJECT)
+            url = (f"https://dev.azure.com/{org}/{project}/_apis/wit/wiql"
+                   f"?$top={max_items * 2}&api-version=7.1")
+            r = requests.post(url, headers=headers, json=wiql,
+                              verify=False, timeout=15)
+            r.raise_for_status()
+            for wi in (r.json().get('workItems') or [])[:max_items * 2]:
+                rid = wi.get('id')
+                if rid and rid not in related_ids and rid != work_item_id:
+                    related_ids.append(rid)
+                if len(related_ids) >= max_items:
+                    break
+        except Exception:
+            pass
+
+    # 3. Fetch each related item's Description + AC (best-effort)
+    for rid in related_ids[:max_items]:
+        try:
+            wi = get_work_item_full_details(rid)
+            if not wi:
+                continue
+            f = wi.get('fields', {}) or {}
+            rtitle = f.get('System.Title', '') or ''
+            rdesc = clean_html(f.get('System.Description', '') or '')
+            rac = clean_html(
+                f.get('Microsoft.VSTS.Common.AcceptanceCriteria', '') or '')
+            snippet = (rtitle + '\n' + rdesc + '\n' + rac).strip()
+            if snippet:
+                blobs.append(snippet[:1500])
+                related_titles.append(f"#{rid} {rtitle[:100]}")
+        except Exception:
+            continue
+
+    related_blob = ('\n\n'.join(blobs))[:8000].lower()
+    return {
+        'related_blob': related_blob,
+        'related_ids': related_ids[:max_items],
+        'related_titles': related_titles,
+    }
+
+
 def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     """
     Rules-based test case generator. Strictly follows Rules.md.
@@ -637,9 +731,18 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     #                        redesign / workflow change is not OOS).
     #   • allow_security   → True only if the story explicitly raises
     #                        an auth / unauthorized / permission concern.
-    scope = _extract_story_scope(title, desc_clean, ac_clean, domain)
+    # ── Related work-item context (Parent Feature, Related links,
+    #    same-Area-Path history). Feeds `_extract_story_scope` so the
+    #    term-weighting picks up module-history vocabulary too.
+    _wi_id = None
+    try:
+        _wi_id = int(work_item.get('id') or fields.get('System.Id'))
+    except Exception:
+        _wi_id = None
+    related_ctx = _fetch_related_story_context(_wi_id, area_path) if _wi_id else {}
+    scope = _extract_story_scope(title, desc_clean, ac_clean, domain,
+                                 related=related_ctx)
     # ── Detect story characteristics for conditional rule application ─────
-    # NOTE: these are now scope-aware — they only fire when the STORY
     # actually talks about them. The domain catalogue still supplies
     # the right *labels*, but never extra coverage scope.
     has_data_input = scope['allow_data']
@@ -742,36 +845,46 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
         # ── Build steps & per-step expected — follow Rules.md sample format
         # (clear imperative actions, no "Ensure/Perform/Validate" prefixes).
         actor_label = roles_found[0] if has_roles else 'User'
-        portal_label = domain.get('portal') or 'EPP'
+        portal_label = _resolve_portal(domain.get('portal'), title)
         route_label = domain.get('route')
+
+        # Portal disambiguation — RULE STEP 17: never leave Step 1 as the
+        # vague "EPP". If domain resolution didn't pick a portal, infer
+        # one from the story title so the tester knows exactly where to
+        # log in (Escrow Dashboard vs AP Admin Portal vs Escrow Customer).
+        portal_label = _resolve_portal(portal_label, title)
 
         steps = []
         exps = []
 
-        # Step 1 — Login (always present, gives a concrete starting point)
+        # Step 1 — Login (concrete portal, never bare "EPP")
         steps.append(f"Log in to the {portal_label} as a {actor_label}")
-        exps.append(f"{actor_label} is signed in and lands on the role-based default page")
+        exps.append(f"{actor_label} is signed in and lands on the "
+                    f"{portal_label} default page")
 
-        # Step 2 — Navigate to the feature (use the real route if we know it)
+        # Step 2 — Navigate to the feature ONLY when we have a real route
+        # or a distinct screen name. A bare "Navigate to the <feature>
+        # screen / functionality" adds no information when the feature
+        # label is the whole story title (RULE STEP 17).
+        _screen = domain.get('matched_screen')
         if route_label:
             steps.append(f"Navigate to {feature_label} ({route_label})")
             exps.append(f"The {feature_label} screen at {route_label} is displayed")
-        else:
-            steps.append(f"Navigate to the {feature_label} screen / functionality")
-            exps.append(f"{feature_label} screen is displayed")
+        elif _screen and _screen != '—' and _screen.lower() not in feature_label.lower():
+            steps.append(f"Open the {_screen} screen")
+            exps.append(f"The {_screen} screen is displayed")
+        # else: skip — Step 3 (the WHEN action) makes navigation obvious
 
-        # Step 3 — Set up preconditions from GIVEN (only if non-trivial)
-        if given_text and len(given_text) > 5:
-            steps.append(_imperative(given_text))
-            exps.append("Precondition state is established successfully")
-
-        # Step 4 — Trigger the action from WHEN (or fall back to AC summary)
+        # Step 3 — Trigger the action from WHEN (or fall back to AC summary).
+        # We deliberately DROP the previous "Set up preconditions from
+        # GIVEN" step: preconditions already live in the Preconditions
+        # field, so restating them as a step was noise (RULE STEP 17).
         action_text = when_text or ac_summary
         if action_text:
             steps.append(_imperative(action_text))
             exps.append("Action is executed without errors")
 
-        # Step 5 — Validate the outcome from THEN (do NOT mention "AC" in steps)
+        # Step 4 — Validate the outcome from THEN (do NOT mention "AC" in steps)
         if then_text:
             steps.append("Verify the system response against the expected business outcome")
             exps.append(then_text)
@@ -779,7 +892,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             steps.append("Verify the resulting behavior matches the objective of this test")
             exps.append("System behavior matches the objective stated in the test case")
 
-        # Step 6 (optional) — If the screen has known API hints, validate them
+        # Step 5 (optional) — If the screen has known API hints, validate them
         api_hints = domain.get('api_hints') or []
         if api_hints and (has_api or 'api' in combined or 'endpoint' in combined):
             steps.append("Verify the underlying API call and response")
@@ -830,7 +943,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     # ══════════════════════════════════════════════════════════════════════
     if not any(tc['test_category'] == 'Functional' or tc['test_category'] == 'API' for tc in test_cases):
         actor = roles_found[0]
-        portal_label = domain.get('portal') or 'EPP'
+        portal_label = _resolve_portal(domain.get('portal'), title)
         route_label = domain.get('route')
         nav_step = (f"Navigate to {feature_label} ({route_label})"
                     if route_label else f"Navigate to the {feature_label} screen")
@@ -877,7 +990,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     # ══════════════════════════════════════════════════════════════════════
     if not any(tc['test_category'] == 'Negative' for tc in test_cases):
         if scope['allow_security'] and has_roles and len(roles_found) >= 1:
-            portal_label = domain.get('portal') or 'EPP'
+            portal_label = _resolve_portal(domain.get('portal'), title)
             route_label = domain.get('route')
             wrong_role = domain.get('negative_role') or 'a role outside the allowed list'
             primary = domain.get('primary_role') or roles_found[0]
@@ -915,7 +1028,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             })
         elif scope['allow_data']:
             actor = roles_found[0]
-            portal_label = domain.get('portal') or 'EPP'
+            portal_label = _resolve_portal(domain.get('portal'), title)
             add_tc({
                 'title': f"System rejects invalid inputs for {feature_label}",
                 'objective': (f"Verify that the {feature_label} feature rejects invalid, "
@@ -988,6 +1101,179 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
     # ══════════════════════════════════════════════════════════════════════
 
     # ══════════════════════════════════════════════════════════════════════
+    # RULE FOCUS 19: Story-Term-Driven Verification (RULE SCOPE 16 partner)
+    # --------------------------------------------------------------------
+    # For every distinctive noun phrase / acronym / quoted term the
+    # generator distilled from the Description → Background → Approach
+    # → Scope sections (up to 3), emit ONE laser-focused TC that
+    # verifies the story's specific behaviour for that term. This
+    # replaces the older habit of falling back to generic "System
+    # behaves correctly" TCs when the AC block is thin.
+    # ══════════════════════════════════════════════════════════════════════
+    _story_terms = scope.get('story_terms') or []
+    _focus_lines = scope.get('description_focus') or []
+
+    def _term_context(term: str) -> str:
+        """Return the shortest description_focus line that mentions the
+        term, so the generated TC steps quote real story prose."""
+        t = term.lower()
+        best = ''
+        for ln in _focus_lines:
+            if t in ln.lower():
+                if not best or len(ln) < len(best):
+                    best = ln
+        return best[:220] if best else ''
+
+    _term_ac_refs = set()
+    for term in _story_terms[:3]:
+        # Skip terms that already appear verbatim in an existing TC title
+        if any(term.lower() in (tc.get('title') or '').lower()
+               for tc in test_cases):
+            continue
+        ac_ref = f"Focus: {term}"
+        if ac_ref in _term_ac_refs:
+            continue
+        _term_ac_refs.add(ac_ref)
+
+        ctx = _term_context(term)
+        actor = roles_found[0] if roles_found else 'User'
+        portal_label = _resolve_portal(domain.get('portal'), title)
+        add_tc({
+            'title': f"{feature_label} correctly handles {term} per story spec",
+            'objective': (
+                f"Verify that the {feature_label} feature honours the "
+                f"specific '{term}' requirement called out in this story's "
+                f"Description / Background / Approach sections."
+                + (f" Story context: \"{ctx}\"." if ctx else "")
+            ),
+            'preconditions': (
+                f"{actor} is signed in to the {portal_label}; the story's "
+                f"'{term}' precondition (as described in the User Story) is "
+                f"in place"
+            ),
+            'steps': [
+                f"Log in to the {portal_label} as a {actor}",
+                (f"Reproduce the story scenario that exercises '{term}'"
+                 + (f" — namely: {ctx}" if ctx else "")),
+                f"Trigger the action described in the story for '{term}'",
+                f"Verify the resulting behaviour matches the story's stated "
+                f"outcome for '{term}'",
+            ],
+            'expected': [
+                f"{actor} is signed in on the {portal_label}",
+                f"The '{term}' precondition is established as described",
+                "Action completes without errors",
+                f"System behaviour for '{term}' matches the story's spec — no "
+                f"generic fallback, no unrelated side effects",
+            ],
+            'overall_expected': (
+                f"'{term}' behaves exactly as the User Story's Description / "
+                f"Background / Approach mandates."
+            ),
+            'priority': 2,
+            'test_type': 'Regression',
+            'test_category': 'Functional',
+            'ac_ref': ac_ref,
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RULE EDGE 18: Story-driven Edge-Case Coverage
+    # --------------------------------------------------------------------
+    # Scan the story text for concrete edge-case cues (integrations,
+    # templates, tokens, retries, rate limits, currencies, timezones,
+    # long-running jobs, feature flags). For each cue that fires, emit a
+    # single targeted edge-case TC tied to that specific concern — NOT a
+    # generic boundary sweep.
+    # ══════════════════════════════════════════════════════════════════════
+    edge_specs = [
+        # (cue_regex, ac_ref, title_suffix, objective, action, expected)
+        (r'\bsendgrid|\btemplate|\btemplate\s+id',
+         'Edge: Template Missing',
+         'behaves gracefully when the SendGrid template ID is missing or misconfigured',
+         "Verify that when the configured SendGrid template ID is invalid, missing, or fails to render with the extended payload, "
+         "the system logs a clear error and falls back safely without sending a broken email.",
+         "Point the notification service at a non-existent / disabled SendGrid template ID and trigger the email flow",
+         "The email send is skipped or a fallback template is used; a clear error is logged; no partial/broken email is sent to the recipient"),
+        (r'\bpayload|\bextra field|\bnew field|\bextended',
+         'Edge: Payload Missing Fields',
+         'still renders when optional payload fields (logo, support email) are missing',
+         "Verify that when optional extended-payload fields (e.g., logo URL, support email) are absent or null, "
+         "the email still renders with sensible defaults and no placeholder tokens leak into the recipient's inbox.",
+         "Trigger the email with the extended-payload fields set to null/empty",
+         "Email is delivered; unresolved placeholders (e.g., {{logo}}) are NOT visible; default values are used where defined"),
+        (r'\bretry|\btransient|\brate\s*limit|\b429|\b5\d{2}\b',
+         'Edge: Transient Provider Failure',
+         'retries on transient SendGrid failures and does not duplicate emails',
+         "Verify that transient SendGrid failures (HTTP 429 / 5xx) are retried per the configured policy and that the recipient "
+         "never receives duplicate emails when a retry ultimately succeeds.",
+         "Force SendGrid to return HTTP 429 then 200 for the same message",
+         "Retry policy is honoured; exactly ONE email is delivered; the retry attempt is logged with a correlation ID"),
+        (r'\bunicode|\bemoji|\bnon-?ascii|\binternational|\baccent',
+         'Edge: Unicode Payload',
+         'handles Unicode / non-ASCII characters in the payload',
+         "Verify that recipient names, support-email text, and template fields containing Unicode / non-ASCII characters "
+         "are rendered and stored correctly end-to-end.",
+         "Send an email whose payload fields contain accented, CJK, emoji and RTL characters",
+         "Rendered email preserves every character; no mojibake; downstream logs store the payload in its original encoding"),
+        (r'\baudit|\blog|\bcorrelation',
+         'Edge: Audit Trail',
+         'writes a complete audit entry for every send attempt',
+         "Verify that every send attempt — success, failure, or retry — is recorded in the audit log with the User Story-mandated fields "
+         "(template ID, recipient, timestamp, status, correlation ID) so a support engineer can trace any single email later.",
+         "Trigger a successful send, a failed send, and a retried send in the same run",
+         "Three distinct audit entries exist; each carries template ID + recipient + status + correlation ID; no PII beyond the recipient address is logged"),
+    ]
+    _story_blob = scope.get('story_blob', '') or combined
+    for cue_rx, ac_ref, suffix, objective, action, expected in edge_specs:
+        if not re.search(cue_rx, _story_blob, flags=re.IGNORECASE):
+            continue
+        # Skip if we've already emitted an equivalent edge for this ref
+        if any(t.get('ac_ref') == ac_ref for t in test_cases):
+            continue
+        actor = roles_found[0] if roles_found else 'Support'
+        portal_label = _resolve_portal(domain.get('portal'), title)
+        # Email-flow edges need a mailbox verification step; other edges
+        # just need a system-response verification.
+        _is_email = bool(re.search(r'\bemail|sendgrid|mailbox|inbox|recipient',
+                                   _story_blob, re.IGNORECASE))
+        _mail_step = ("Open the recipient's mailbox (e.g., Gmail) and inspect the "
+                      "delivered email content, headers and any leaked placeholders")
+        _mail_exp = ("Recipient's mailbox shows exactly one email whose subject, body, "
+                     "logo, support-email link and template render as specified — "
+                     "no {{placeholder}} tokens are visible")
+        _steps = [
+            f"Log in to the {portal_label} as a {actor}",
+            action,
+            "Observe the system response and any logged events",
+        ]
+        _exps = [
+            f"{actor} is signed in on the {portal_label}",
+            "Action completes with the expected edge-case behavior",
+            "System response and logs match the objective",
+        ]
+        if _is_email:
+            _steps.append(_mail_step)
+            _exps.append(_mail_exp)
+        _steps.append("Verify the recipient outcome and audit trail")
+        _exps.append(expected)
+        add_tc({
+            'title': f"{feature_label} {suffix}",
+            'objective': objective,
+            'preconditions': (f"{actor} is signed in to the {portal_label}; "
+                              + ("the SendGrid provider is reachable and a test "
+                                 "mailbox (e.g., Gmail) is available for the recipient"
+                                 if _is_email else
+                                 "the notification / email service is reachable")),
+            'steps': _steps,
+            'expected': _exps,
+            'overall_expected': expected,
+            'priority': 2,
+            'test_type': 'Regression',
+            'test_category': 'Negative' if 'Failure' in suffix or 'Missing' in suffix else 'Functional',
+            'ac_ref': ac_ref,
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
     # RULE FUNC 10: UI & Field Validation
     # --------------------------------------------------------------------
     # SCOPE-AWARE: ``has_ui`` is now driven by ``scope['allow_ui']``, so
@@ -1038,7 +1324,7 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             and domain.get('workflow_steps')
             and domain.get('confidence', 0) >= 0.4):
         wf_actor = domain.get('primary_role') or roles_found[0]
-        wf_portal = domain.get('portal') or 'EPP'
+        wf_portal = _resolve_portal(domain.get('portal'), title)
         wf_route = domain.get('route')
         wf_steps = [f"Log in to the {wf_portal} as a {wf_actor}"] \
                    + list(domain['workflow_steps'])
@@ -1219,25 +1505,13 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
             cat = (tc.get('test_category') or '').lower()
 
             if ac_ref.startswith('ac'):
-                # AC-driven TC → enrich its Objective with a domain hook
-                obj = tc.get('objective', '') or ''
-                if kw.lower() not in obj.lower() and obj:
-                    tc['objective'] = _join_sentence(
-                        obj,
-                        f"Also exercises the '{kw_disp}' flow "
-                        f"previously covered in this area."
-                    )
+                # AC-driven TC → historical enrichment is NOT written to
+                # any user-visible field. It stays in the internal audit
+                # trail only (LessonsLearned Lesson 15).
+                pass
             elif cat == 'negative' or ac_ref == 'security':
-                # Negative / security TC → add a sharp precondition bullet
-                bullet = (f"• Historical baseline: prior stories in this area "
-                          f"have hardened '{kw_disp}' handling — the same "
-                          f"safeguards must hold here.")
-                existing = tc.get('preconditions', '') or ''
-                if 'Historical baseline' not in existing:
-                    tc['preconditions'] = (
-                        existing.rstrip() + "\n" + bullet
-                        if existing else bullet
-                    )
+                # Negative / security TC → same policy as AC-driven.
+                pass
             elif ac_ref == 'workflow' or cat == 'api':
                 # Workflow / API TC → tack on a quick regression-anchor step
                 extra_step = (f"Smoke-check the '{kw_disp}' regression path "
@@ -1252,46 +1526,18 @@ def generate_test_cases_from_acceptance_criteria(work_item, history=None):
                     tc['steps'] = steps
                     tc['expected'] = exps
             elif ac_ref.startswith('data:'):
-                # Data-driven TC → mention the historical data shape
-                obj = tc.get('objective', '') or ''
-                if kw.lower() not in obj.lower() and obj:
-                    tc['objective'] = _join_sentence(
-                        obj,
-                        f"Data shapes should remain compatible with the "
-                        f"'{kw_disp}' coverage already in place."
-                    )
+                # Data-driven TC → no user-visible enrichment.
+                pass
             else:
-                # Happy-Path / Role / generic → light objective touch
-                obj = tc.get('objective', '') or ''
-                if kw.lower() not in obj.lower() and obj:
-                    tc['objective'] = _join_sentence(
-                        obj,
-                        f"Keeps parity with the '{kw_disp}' baseline "
-                        f"established by recent stories in this area."
-                    )
+                # Happy-Path / Role / generic → no user-visible enrichment.
+                pass
 
-        # Stash the enrichment summary on the FIRST TC only, as a
-        # single audit-trail bullet — replaces the old per-TC boilerplate.
-        if used_keywords and test_cases:
-            anchor = test_cases[0]
-            audit_bits = []
-            if used_keywords:
-                audit_bits.append(
-                    "Historical enrichment applied: "
-                    + ", ".join(sorted(k.capitalize() for k in used_keywords))
-                )
-            if neighbour_ids_sample:
-                audit_bits.append(
-                    "Reference prior stories: "
-                    + ", ".join(f"#{i}" for i in neighbour_ids_sample)
-                )
-            audit_line = "• " + " — ".join(audit_bits)
-            existing = anchor.get('preconditions', '') or ''
-            if 'Historical enrichment applied' not in existing:
-                anchor['preconditions'] = (
-                    existing.rstrip() + "\n" + audit_line
-                    if existing else audit_line
-                )
+        # Historical enrichment is deliberately NOT stashed on any
+        # user-visible field of any TC. The full history summary
+        # continues to live in the internal `history_ctx` object and is
+        # surfaced on the review page's "Historical Context Used" panel
+        # (RULE HIST 15) — but never in Objective, Preconditions, Title,
+        # Steps or Expected. See LessonsLearned Lesson 15.
 
     # ══════════════════════════════════════════════════════════════════════
     # RULE GEN 04 + RULE MAINT 12: Club / dedupe similar-outcome test cases
@@ -1357,7 +1603,7 @@ _ROLE_PATTERNS = (
 
 
 def _extract_story_scope(title: str, desc_clean: str, ac_clean: str,
-                         domain: dict) -> dict:
+                         domain: dict, related: dict | None = None) -> dict:
     """Build a story-scope dict from the User Story text.
 
     Returns
@@ -1380,6 +1626,164 @@ def _extract_story_scope(title: str, desc_clean: str, ac_clean: str,
     """
     blob_raw = " ".join([title or '', desc_clean or '', ac_clean or ''])
     blob = blob_raw.lower()
+
+    # ── 0. Description-driven sections ────────────────────────────────────
+    # Parse the User Story Description for named sections that give the
+    # generator narrative context BEYOND the Acceptance Criteria. Their
+    # content is promoted into `description_focus` — a short list of key
+    # phrases used to (a) display in phase 4 for reviewer transparency
+    # and (b) steer keyword / edge-case matching so the generated TCs
+    # are tightly bound to the story instead of generic. This mirrors
+    # how a human tester first reads the Description → Background →
+    # Approach → Assumptions BEFORE opening the AC block.
+    description_focus: list = []
+    section_hits: dict = {}   # header → first ~240 chars of matched body
+    if desc_clean:
+        section_patterns = [
+            # In / Out of scope
+            r'in\s*scope',
+            r'scope',
+            # Narrative
+            r'summary',
+            r'description',
+            r'overview',
+            r'objective',
+            r'goal[s]?',
+            r'problem\s*statement',
+            # Domain background
+            r'background',
+            r'context',
+            r'business\s*context',
+            # Approach & rationale
+            r'decision\s+on\s+approach',
+            r'approach',
+            r'technical\s+approach',
+            r'proposed\s+solution',
+            r'design',
+            r'flow',
+            r'rationale',
+            # Constraints
+            r'assumption[s]?',
+            r'dependencies',
+            r'impacted\s+area[s]?',
+            r'impact',
+            r'risks?',
+            r'notes?',
+        ]
+        # A stop-word set so a section body doesn't accidentally swallow
+        # the next section's header or the AC block.
+        _stop_next = (
+            r'(?=(?:\n\s*\n)|'
+            r'(?:out\s*of\s*scope)|'
+            r'(?:acceptance\s*criteri)|'
+            r'(?:decision\s+on\s+approach)|'
+            r'(?:technical\s+approach)|'
+            r'(?:approach)|'
+            r'(?:assumption)|'
+            r'(?:dependencies)|'
+            r'(?:impact)|'
+            r'(?:risks?)|'
+            r'(?:notes?\s*[:|])|'
+            r'\Z)'
+        )
+        for header in section_patterns:
+            m = re.search(
+                rf'(?:^|\n)\s*(?:\**|#*)\s*{header}\s*[:\-–—]?\s*'
+                r'(.+?)' + _stop_next,
+                desc_clean, flags=re.IGNORECASE | re.DOTALL,
+            )
+            if m:
+                chunk = m.group(1).strip()
+                if chunk and header not in section_hits:
+                    section_hits[header] = chunk[:400]
+                for line in re.split(r'[•\u2022\n;\.]+', chunk):
+                    line = line.strip(' -–—:.\t')
+                    if 6 <= len(line) <= 240 and line.lower() not in [
+                            x.lower() for x in description_focus]:
+                        description_focus.append(line)
+        # Cap so phase-4 output stays readable
+        description_focus = description_focus[:10]
+
+    # ── 0b. Story-specific keywords for targeted TC generation ────────────
+    # Weighted scoring: each candidate term gets
+    #     score = Σ (section_weight × occurrences_in_section)
+    # so terms appearing in high-signal sections (Approach / Scope /
+    # Title) rank above ones only found in Background or in related
+    # (module-history) stories. Top-N by score become story_terms;
+    # RULE FOCUS 19 then generates TCs for the highest-signal terms
+    # first, eliminating generic low-signal cases.
+    story_terms: list = []
+    story_term_scores: dict = {}
+    _term_rx = re.compile(
+        r'\b(?:'
+        # 2-3 word Title-Cased noun phrases (e.g. "Sender Display Name",
+        # "Onboarding Generation Link", "Payment Monitoring")
+        r'(?:[A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+){1,3})|'
+        # ALL-CAPS acronyms (ACH, RTP, IBA, GIS, EMD, CSV)
+        r'(?:\b[A-Z]{2,6}\b)|'
+        # Quoted phrases from the story
+        r'\"([^\"\n]{3,60})\"|'
+        r'\u201c([^\u201d\n]{3,60})\u201d'
+        r')'
+    )
+    _stop_terms = {
+        'The', 'This', 'That', 'These', 'Those', 'And', 'Or', 'But',
+        'When', 'Then', 'Given', 'With', 'For', 'From', 'To', 'By',
+        'Story', 'User', 'System', 'EPP', 'Note', 'Notes', 'Scope',
+        'Description', 'Summary', 'Background', 'Context', 'Approach',
+        'Objective', 'Overview', 'Design', 'Flow', 'Impact', 'Risks',
+        'Assumption', 'Assumptions', 'Dependencies',
+    }
+    # section_label → (weight, text)
+    _weighted_sources: list = [
+        ('title',       5.0, title or ''),
+    ]
+    # Weight the section_hits by header — Approach/Scope > Description
+    # > Background/Notes. Anything not classified defaults to 2.0.
+    _section_weights = {
+        'decision on approach': 5.0, 'approach': 4.5,
+        'technical approach': 4.5, 'proposed solution': 4.0,
+        'scope': 4.5, 'in scope': 4.5,
+        'objective': 4.0, 'goal': 4.0, 'goals': 4.0,
+        'problem statement': 3.5, 'summary': 3.0,
+        'description': 3.0, 'overview': 3.0,
+        'background': 2.5, 'business context': 2.5, 'context': 2.5,
+        'rationale': 2.5, 'design': 3.0, 'flow': 3.0,
+        'assumption': 2.0, 'assumptions': 2.0, 'dependencies': 2.0,
+        'impacted area': 2.0, 'impacted areas': 2.0, 'impact': 2.0,
+        'risks': 2.0, 'notes': 1.5, 'note': 1.5,
+    }
+    for _hdr, _body in (section_hits or {}).items():
+        _w = _section_weights.get(_hdr.lower(), 2.0)
+        _weighted_sources.append((f'section:{_hdr}', _w, _body))
+    # Related (module-history) context gets a low weight — it can
+    # BOOST an existing term but rarely introduces a new top-N term
+    # on its own.
+    if related and related.get('related_blob'):
+        _weighted_sources.append(('related', 0.8, related['related_blob']))
+    # AC clauses count as medium signal (they'll usually be covered
+    # by AC-driven TCs already, but they help disambiguate ties).
+    if ac_clean:
+        _weighted_sources.append(('ac', 1.5, ac_clean))
+
+    _seen_norm: dict = {}   # normalised → canonical form for de-dupe
+    for _label, _weight, _src in _weighted_sources:
+        if not _src:
+            continue
+        for m in _term_rx.finditer(_src):
+            term = (m.group(1) or m.group(2) or m.group(0) or '').strip()
+            if not term:
+                continue
+            first = term.split()[0]
+            if first in _stop_terms or len(term) < 3:
+                continue
+            norm = term.lower()
+            canonical = _seen_norm.setdefault(norm, term)
+            story_term_scores[canonical] = (
+                story_term_scores.get(canonical, 0.0) + _weight)
+    # Top-N by weighted score
+    story_terms = [t for t, _ in sorted(
+        story_term_scores.items(), key=lambda kv: (-kv[1], kv[0]))][:12]
 
     # ── 1. Named roles ────────────────────────────────────────────────────
     named_roles: list = []
@@ -1460,13 +1864,40 @@ def _extract_story_scope(title: str, desc_clean: str, ac_clean: str,
     return {
         'named_roles':       named_roles,
         'out_of_scope':      out_of_scope,
+        'description_focus': description_focus,
+        'section_hits':      section_hits if desc_clean else {},
+        'story_terms':       story_terms,
+        'story_term_scores': story_term_scores,
+        'related_ids':       (related or {}).get('related_ids', []),
+        'related_titles':    (related or {}).get('related_titles', []),
         'allow_multi_role':  allow_multi_role,
         'allow_data':        allow_data,
         'allow_ui':          allow_ui,
         'allow_workflow':    allow_workflow,
         'allow_security':    allow_security,
-        'story_blob':        blob,
+        'story_blob':        blob + ' ' + ((related or {}).get('related_blob') or ''),
     }
+
+
+def _resolve_portal(portal_label: str, title: str) -> str:
+    """Return a concrete portal name so Step 1 of every TC is unambiguous.
+
+    Falls back to title-driven inference when domain resolution left the
+    generic "EPP" placeholder. Handles Admin / A/P, Escrow Customer,
+    Escrow Dashboard, and Parties Onboarding portals.
+    """
+    if portal_label and portal_label not in ('EPP', '', None):
+        return portal_label
+    _tl = (title or '').lower()
+    if re.search(r'\ba/?p\b|\badmin\b|admin portal|sendgrid', _tl):
+        return 'AP Admin Portal'
+    if 'escrow' in _tl and 'customer' in _tl:
+        return 'Escrow Customer Portal'
+    if 'escrow' in _tl or 'payment monitoring' in _tl:
+        return 'Escrow Dashboard'
+    if 'parties' in _tl or 'onboarding' in _tl:
+        return 'Parties Onboarding Portal'
+    return 'EPP'
 
 
 def _short_feature(title):
@@ -1695,15 +2126,17 @@ def _build_condition_phrase(text):
         scope_what = _titlecase_phrase(m.group(2))
         return f"reflects correct {scope_what} {m.group(1).lower()}"
 
-    # Pattern: starts with an outcome verb already — keep first 6-7 words
+    # Pattern: starts with an outcome verb already — keep a longer window
+    # (up to 12 words) so the verb's object survives, e.g.
+    # "sends the new SendGrid template payload with logo & support email".
     if re.match(r'^(excludes?|includes?|hides?|shows?|displays?|rejects?|'
                 r'allows?|blocks?|enables?|disables?|persists?|saves?|'
                 r'returns?|sends?|navigates?|opens?|filters?)\b', low):
-        return _clip_words(t, max_words=8)
+        return _clip_words(t, max_words=12)
 
-    # ── 3. Fallback: clip to a clean ≤ 8-word fragment without breaking
+    # ── 3. Fallback: clip to a clean ≤ 10-word fragment without breaking
     #       grammar (drops trailing prepositions / articles / conjunctions).
-    return _clip_words(t, max_words=8)
+    return _clip_words(t, max_words=10)
 
 
 # Function words that must never appear at the END of a title fragment.
@@ -1908,7 +2341,7 @@ def _build_objective(feature_label, given_text, when_text, then_text, ac_summary
 
 def _normalize_title(t):
     """RULE GEN 02 — start with 'Verify', no 'that', collapse whitespace,
-    no trailing punctuation, max 90 chars (precise & to-the-point).
+    no trailing punctuation, max 150 chars (precise & to-the-point).
 
     Crucially, the 90-char cap NEVER ends on a preposition, article, or
     conjunction (a / the / in / on / of / to / for / with / from / by /
@@ -1927,8 +2360,8 @@ def _normalize_title(t):
     if not t.lower().startswith('verify'):
         t = 'Verify ' + t
     t = re.sub(r'\s+', ' ', t).strip()
-    if len(t) > 90:
-        cut = t[:90].rsplit(' ', 1)[0]
+    if len(t) > 150:
+        cut = t[:150].rsplit(' ', 1)[0]
         # Drop any trailing function words / dangling verbs so the title
         # still parses as a complete clause.
         words = cut.split(' ')
@@ -1936,7 +2369,7 @@ def _normalize_title(t):
                          or words[-1].lower().strip(',;:.-') in _TRAILING_DANGLING_VERBS):
             words.pop()
         cut = ' '.join(words).rstrip(',;:- ')
-        t = cut if cut else t[:90]
+        t = cut if cut else t[:150]
     # Final safety pass — even under 90 chars, never end on a dangling
     # transitive verb ("… should not contain", "… link should point to").
     words = t.split(' ')
@@ -1958,6 +2391,48 @@ def _normalize_title(t):
 # ══════════════════════════════════════════════════════════════════════════
 
 _LESSONS_CACHE = {'path': None, 'mtime': 0, 'headings': [], 'raw': ''}
+
+
+def _auto_refresh_repo_domain(max_age_days: int = 14) -> None:
+    """Every N days, re-run `test/_probe_repo_domain.py` so the
+    source-code-derived business domain section of
+    `EPP_Portal_Business_Documentation.md` stays fresh.
+
+    Silently no-ops if the probe or its stamp are missing, or if the
+    last run is still within the cadence window.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    import subprocess as _sp
+
+    probe = os.path.join(os.path.dirname(__file__), '_probe_repo_domain.py')
+    stamp = os.path.join(os.path.dirname(__file__), '.repo_domain_lastrun')
+    if not os.path.isfile(probe):
+        return
+
+    due = True
+    if os.path.isfile(stamp):
+        try:
+            with open(stamp, 'r', encoding='utf-8') as fh:
+                last = _dt.fromisoformat(fh.read().strip())
+            age_days = (_dt.utcnow() - last).days
+            if age_days < max_age_days:
+                print(f"      Domain doc : fresh "
+                      f"({age_days}d old, cadence {max_age_days}d) — skipping refresh",
+                      flush=True)
+                due = False
+            else:
+                print(f"      Domain doc : {age_days}d old — running "
+                      f"scheduled repo-domain refresh…", flush=True)
+        except Exception:
+            pass
+
+    if not due:
+        return
+
+    try:
+        _sp.run([sys.executable, probe], check=False, timeout=600)
+    except Exception as e:
+        print(f"      Domain doc : refresh failed ({e})", flush=True)
 
 
 def _load_lessons_learned():
@@ -2031,6 +2506,35 @@ def _apply_lessons_learned(tc: dict) -> dict:
             tc[k] = [_decode(x) for x in val]
         elif isinstance(val, str):
             tc[k] = _decode(val)
+
+    # Lesson 7 / 10 / 15 — historical enrichment must NEVER appear in
+    # ANY user-visible field (Preconditions, Objective, Steps, Expected,
+    # Title). Strip any leftover "Historical baseline" or "Historical
+    # enrichment applied" / "Reference prior stories" fragments wherever
+    # they slipped through. History still lives on the review page's
+    # "Historical Context Used" panel — not on the TC itself.
+    _HIST_RX = re.compile(
+        r'(?:^|[\.\n\s•\-\u2022\*])\s*'
+        r'(?:Historical\s+(?:baseline|enrichment\s+applied)|'
+        r'Reference\s+prior\s+stories)\b[^\n\.]*\.?',
+        re.IGNORECASE,
+    )
+
+    def _strip_hist(s: str) -> str:
+        if not isinstance(s, str) or not s:
+            return s
+        cleaned = _HIST_RX.sub('', s)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+        return cleaned.strip(' \t\n.•-') and cleaned.rstrip() or ''
+
+    for k in ('preconditions', 'objective', 'overall_expected', 'title'):
+        if k in tc and isinstance(tc[k], str):
+            tc[k] = _strip_hist(tc[k])
+    for k in ('steps', 'expected'):
+        val = tc.get(k)
+        if isinstance(val, list):
+            tc[k] = [_strip_hist(x) if isinstance(x, str) else x for x in val]
 
     # Lesson 2 — strip inline AC subject leaks the condition builder missed
     # (e.g. "Extended Payload EPP sends the new"). Only remove when the
@@ -2418,13 +2922,14 @@ def create_test_case_in_ado(tc_title, steps_xml, preconditions_html, area_path, 
         priority = priority_map.get(priority, 2)
 
     # Build the tag list. The only mandatory origin tag going forward
-    # is "AI TestCase" (the older "Gen-AI" marker has been retired per
-    # QA guidance). We then add the test_type and test_category (from
-    # extra_fields) and any EPP area tag (AP_Bulk / Resware_OB / etc.).
-    # These are surfaced via System.Tags so they remain visible in ADO
-    # even when the project's process template lacks the Custom.* fields.
-    # Tags in ADO are semicolon-separated.
-    tag_parts = ["AI TestCase"]
+    # is "AI Test Case" (the older "AI TestCase" / "Gen-AI" markers have
+    # been retired per QA guidance). We then add the test_type and
+    # test_category (from extra_fields) and any EPP area tag
+    # (AP_Bulk / Resware_OB / etc.). These are surfaced via System.Tags
+    # so they remain visible in ADO even when the project's process
+    # template lacks the Custom.* fields. Tags in ADO are
+    # semicolon-separated.
+    tag_parts = ["AI Test Case"]
     if extra_fields:
         tt = (extra_fields.get('Custom.TestType') or '').strip()
         tc_cat = (extra_fields.get('Custom.TestCategory') or '').strip()
@@ -2680,6 +3185,13 @@ def generate_and_push_test_cases(story_id):
     _phase("\n[4/5] Generating test cases from Acceptance Criteria "
            "(scope-strict, RULE SCOPE 16)…")
 
+    # Auto-refresh the source-code-derived business domain doc every
+    # 14 days so the generator's context stays in sync with the repos.
+    try:
+        _auto_refresh_repo_domain(max_age_days=14)
+    except Exception as _e:
+        print(f"      Domain doc : refresh skipped ({_e})", flush=True)
+
     # Load the LessonsLearned.md guardrails so every TC is scrubbed
     # against the known-bad patterns before it reaches the user.
     lessons = _load_lessons_learned()
@@ -2693,6 +3205,71 @@ def generate_and_push_test_cases(story_id):
     else:
         print("      Guardrails : LessonsLearned.md not found — "
               "using built-in defaults only", flush=True)
+
+    # Analyze the User Story Description + Scope up-front so the user can
+    # see the generator has actually read them (not just the ACs).
+    _pre_desc = clean_html(work_item['fields'].get('System.Description', '') or '')
+    _pre_ac = clean_html(work_item['fields'].get(
+        'Microsoft.VSTS.Common.AcceptanceCriteria', '') or '')
+    _pre_related = _fetch_related_story_context(int(story_id), area_path)
+    _pre_scope = _extract_story_scope(title, _pre_desc, _pre_ac, pre_domain,
+                                      related=_pre_related)
+    _desc_chars = len(_pre_desc)
+    _focus = _pre_scope.get('description_focus') or []
+    _oos = _pre_scope.get('out_of_scope') or []
+    _sections = _pre_scope.get('section_hits') or {}
+    _terms = _pre_scope.get('story_terms') or []
+    print(f"      Description: {_desc_chars} char(s) analyzed"
+          f"{'  •  no explicit sections found' if not _focus else ''}",
+          flush=True)
+    if _sections:
+        _found_headers = sorted(set(
+            h.replace(r'\s*', ' ').replace(r'[s]?', '').replace('\\', '')
+            for h in _sections))
+        pretty = ', '.join(sorted({
+            re.sub(r'[\\\?\+\*\[\]]', '', h).replace('s*', ' ').strip()
+            for h in _sections
+        }))
+        print(f"      Sections   : {pretty}", flush=True)
+    if _focus:
+        print(f"      In-Scope   : {len(_focus)} focus phrase(s) extracted "
+              f"from Description")
+        for line in _focus[:5]:
+            snippet = line if len(line) <= 110 else (line[:107] + '…')
+            print(f"                   • {snippet}")
+        if len(_focus) > 5:
+            print(f"                   … (+{len(_focus)-5} more)")
+    if _oos:
+        print(f"      Out-of-Scope: {len(_oos)} exclusion(s) — those areas will "
+              f"be skipped")
+        for line in _oos[:3]:
+            snippet = line if len(line) <= 110 else (line[:107] + '…')
+            print(f"                   • {snippet}")
+    if _terms:
+        # Show terms with their weighted scores so the reviewer can see
+        # which story vocabulary drove the focused TCs (RULE FOCUS 19).
+        _scores = _pre_scope.get('story_term_scores') or {}
+        if _scores:
+            _ranked = [f"{t} ({_scores.get(t, 0):.1f})" for t in _terms[:10]]
+            print(f"      Story terms: {', '.join(_ranked)}", flush=True)
+        else:
+            print(f"      Story terms: {', '.join(_terms[:10])}", flush=True)
+    _rel_titles = _pre_scope.get('related_titles') or []
+    if _rel_titles:
+        print(f"      Related    : {len(_rel_titles)} module-history item(s) "
+              f"pulled for context")
+        for line in _rel_titles[:4]:
+            snippet = line if len(line) <= 110 else (line[:107] + '…')
+            print(f"                   • {snippet}")
+        if len(_rel_titles) > 4:
+            print(f"                   … (+{len(_rel_titles)-4} more)")
+    _scope_flags = [k.replace('allow_', '')
+                    for k in ('allow_ui', 'allow_data', 'allow_workflow',
+                              'allow_security', 'allow_multi_role')
+                    if _pre_scope.get(k)]
+    print(f"      Scope cues : "
+          f"{', '.join(_scope_flags) if _scope_flags else 'AC-only (no extra expansions)'}",
+          flush=True)
 
     test_cases_raw, ac_clean, desc_clean, _ = \
         generate_test_cases_from_acceptance_criteria(work_item, history=history_ctx)
@@ -3433,3 +4010,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
