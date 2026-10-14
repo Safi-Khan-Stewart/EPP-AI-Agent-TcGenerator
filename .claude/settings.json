@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__epp-testcase-generator__get_user_story",
+      "mcp__epp-testcase-generator__generate_test_cases",
+      "mcp__epp-testcase-generator__get_test_cases",
+      "mcp__epp-testcase-generator__update_test_cases",
+      "mcp__epp-testcase-generator__get_generation_rules",
+      "mcp__epp-testcase-generator__sprint_status",
+      "Bash(.venv/Scripts/python.exe test/ado_advisor.py --json:*)",
+      "Bash(.venv/Scripts/python.exe test/ado_advisor.py --check:*)",
+      "Bash(.venv/Scripts/python.exe test/ado_advisor.py --help)",
+      "Bash(.venv/Scripts/python.exe test/sprint_status.py)",
+      "Bash(.venv/Scripts/python.exe test/_probe_repo_domain.py --force)",
+      "Bash(.venv/Scripts/python.exe -m py_compile:*)",
+      "Bash(python test/ado_advisor.py --json:*)",
+      "Bash(python test/ado_advisor.py --check:*)",
+      "Bash(python test/sprint_status.py)"
+    ],
+    "ask": [
+      "mcp__epp-testcase-generator__push_test_cases",
+      "Bash(.venv/Scripts/python.exe test/ado_advisor.py --push:*)",
+      "Bash(python test/ado_advisor.py --push:*)",
+      "PowerShell(.venv/Scripts/python.exe test/ado_advisor.py --push *)",
+      "PowerShell(.venv\\Scripts\\python.exe test\\ado_advisor.py --push *)",
+      "PowerShell(python test/ado_advisor.py --push *)"
+    ]
+  }
+}

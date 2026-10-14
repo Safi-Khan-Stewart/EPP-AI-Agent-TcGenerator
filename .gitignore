@@ -25,6 +25,9 @@ venv/
 env/
 ENV/
 
+# ── Claude Code (personal settings only; .claude/settings.json is shared) ──
+.claude/settings.local.json
+
 # ── IDE / Editor ──────────────────────────────────────────────────────────────
 .vscode/*
 !.vscode/tasks.json

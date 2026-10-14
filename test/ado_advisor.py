@@ -3,8 +3,13 @@ import sys
 import os
 import base64
 import html
+import json
+import threading
 import urllib.parse
+import uuid
+import webbrowser
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import re
 from typing import Optional
 from fpdf import FPDF
@@ -2399,10 +2404,17 @@ def _auto_refresh_repo_domain(max_age_days: int = 14) -> None:
     `EPP_Portal_Business_Documentation.md` stays fresh.
 
     Silently no-ops if the probe or its stamp are missing, or if the
-    last run is still within the cadence window.
+    last run is still within the cadence window. Set the env var
+    EPP_SKIP_DOMAIN_REFRESH=1 to skip it entirely (the MCP server does,
+    so a tool call never blocks on a multi-minute repo scan).
     """
     from datetime import datetime as _dt, timedelta as _td
     import subprocess as _sp
+
+    if os.environ.get('EPP_SKIP_DOMAIN_REFRESH'):
+        print("      Domain doc : refresh skipped (EPP_SKIP_DOMAIN_REFRESH is set)",
+              flush=True)
+        return
 
     probe = os.path.join(os.path.dirname(__file__), '_probe_repo_domain.py')
     stamp = os.path.join(os.path.dirname(__file__), '.repo_domain_lastrun')
@@ -3081,18 +3093,15 @@ def link_test_case_to_story(test_case_id, story_id):
         return False
 
 
-def generate_and_push_test_cases(story_id):
+def build_review_session(story_id):
     """
-    Given a User Story ID, fetch details, generate test cases,
-    show them in a review HTML page with checkboxes, and let the user
-    push selected ones to ADO via a button click.
-    Launches a local server for the review workflow.
-    """
-    import json
-    import threading
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    import webbrowser
+    Phases 1-4 of the generator: fetch the User Story, resolve the EPP
+    domain + historical context, and generate the test cases.
 
+    Returns the "review session" dict consumed by the review page, the
+    JSON hand-off file and `push_test_cases_to_ado`, or None when the
+    story can't be fetched / yields no test cases.
+    """
     print(f"\n{'='*60}")
     print(f"  Generating Test Cases for User Story #{story_id}")
     print(f"{'='*60}")
@@ -3107,7 +3116,7 @@ def generate_and_push_test_cases(story_id):
     work_item = get_work_item_full_details(story_id)
     if not work_item:
         print("ERROR: Could not fetch user story. Check the ID and your PAT.")
-        return
+        return None
 
     fields = work_item.get('fields', {})
     title = fields.get('System.Title', '')
@@ -3275,7 +3284,7 @@ def generate_and_push_test_cases(story_id):
         generate_test_cases_from_acceptance_criteria(work_item, history=history_ctx)
     if not test_cases_raw:
         print("WARNING: No test cases could be generated.")
-        return
+        return None
 
     # Apply lessons-learned scrubber (drops nulls, cleans titles, decodes
     # HTML entities). Any TC returning None is filtered out.
@@ -3293,13 +3302,29 @@ def generate_and_push_test_cases(story_id):
               f"guardrails", flush=True)
 
     print(f"      Generated  : {len(test_cases_raw)} test case(s)", flush=True)
-    for i, tc in enumerate(test_cases_raw, 1):
-        print(f"                   {i:2d}. [{tc.get('ac_ref','?'):>14s}] "
-              f"{tc['title']}")
+    print_test_case_list(test_cases_raw)
+
+    # Test cases already linked to the story, so nobody pushes duplicates
+    # of coverage that is already in ADO.
+    existing_tcs = []
+    try:
+        existing_tcs = [
+            {'id': wi.get('id'),
+             'title': wi.get('fields', {}).get('System.Title', ''),
+             'state': wi.get('fields', {}).get('System.State', '')}
+            for wi in get_test_cases_for_story(story_id)]
+    except Exception as e:
+        print(f"      Existing   : could not list linked test cases ({e})", flush=True)
+    if existing_tcs:
+        print(f"      Existing   : {len(existing_tcs)} test case(s) already linked "
+              f"to US #{story_id} in ADO", flush=True)
+        for e in existing_tcs[:10]:
+            print(f"                   - #{e['id']} [{e['state']}] {e['title'][:90]}")
+        if len(existing_tcs) > 10:
+            print(f"                   … (+{len(existing_tcs)-10} more)")
 
     # Prepare test cases data for JSON serialization
-    import uuid as _uuid
-    session_id = _uuid.uuid4().hex
+    session_id = uuid.uuid4().hex
     tc_data_list = []
     for idx, tc in enumerate(test_cases_raw):
         steps_list = tc['steps'] if isinstance(tc['steps'], list) else [tc['steps']]
@@ -3328,6 +3353,7 @@ def generate_and_push_test_cases(story_id):
             'epp_area': tc.get('epp_area', ''),
         })
 
+    modules = [tc['application_module'] for tc in tc_data_list if tc['application_module']]
     story_context = {
         'story_id': story_id,
         'session_id': session_id,
@@ -3338,6 +3364,10 @@ def generate_and_push_test_cases(story_id):
         'iteration_path': iteration_path,
         'description': desc_clean,
         'acceptance_criteria': ac_clean,
+        'epp_area': epp_area_tag or '',
+        # Story-level fallback for edited / added test cases that omit it.
+        'application_module': max(set(modules), key=modules.count) if modules else '',
+        'existing_test_cases': existing_tcs,
         'test_cases': tc_data_list,
         # Surface the historical context so the review page can show
         # which neighbouring stories / domain keywords shaped the
@@ -3345,19 +3375,366 @@ def generate_and_push_test_cases(story_id):
         'history': history_ctx or {},
     }
 
-    # ── Build Review HTML ──────────────────────────────────────────────────
-    review_html = _build_review_html(story_context)
-    reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'reports')
-    os.makedirs(reports_dir, exist_ok=True)
-    review_file = os.path.join(reports_dir, f"review_test_cases_US{story_id}.html")
+    return story_context
+
+
+# ── Review sessions: JSON hand-off between generate → review → push ──────────
+# A review session is the story context returned by `build_review_session`.
+# Saving it to reports/test_cases_US<ID>.json lets a reviewer (or Claude)
+# refine the test cases between generation and the push to ADO — via the
+# --check / --review / --push CLI flags or the MCP server tools.
+
+REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'reports')
+
+_VALID_TEST_TYPES = ('Integration', 'Master', 'One-time validation', 'Performance',
+                     'Regression', 'Smoke', 'Smoke & Regression')  # RULE GEN 01.7
+_VALID_TEST_CATEGORIES = ('API', 'Functional', 'Negative')        # RULE GEN 01.8
+
+
+def review_session_path(story_id):
+    """Default location of the review JSON for a User Story."""
+    return os.path.join(REPORTS_DIR, f"test_cases_US{story_id}.json")
+
+
+def save_review_session(ctx, path=None):
+    """Write the review session to JSON and return the file path."""
+    path = path or review_session_path(ctx['story_id'])
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(ctx, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def normalize_review_session(ctx):
+    """Re-validate a review session that may have been edited by hand or by
+    Claude: fill RULE GEN 01 defaults, reject values outside the Rules.md
+    enumerations, re-apply the LessonsLearned guardrails and re-number
+    `index` / `uid` so they follow the current order.
+
+    Raises ValueError listing every problem found, so nothing half-valid can
+    reach ADO.
+    """
+    ctx.setdefault('session_id', uuid.uuid4().hex)
+    for key in ('title', 'state', 'assignee', 'description',
+                'acceptance_criteria', 'epp_area'):
+        ctx.setdefault(key, '')
+    ctx.setdefault('history', {})
+    if 'application_module' not in ctx:  # sessions saved before this field existed
+        modules = [tc.get('application_module') for tc in ctx.get('test_cases') or []
+                   if tc.get('application_module')]
+        ctx['application_module'] = max(set(modules), key=modules.count) if modules else ''
+
+    errors = []
+    cleaned = []
+    for n, tc in enumerate(ctx.get('test_cases') or [], 1):
+        result, tc_errors = _normalize_test_case(tc, ctx, n)
+        errors.extend(tc_errors)
+        if result is None:
+            print(f"      Dropped    : TC {n} blocked by lessons-learned guardrails "
+                  f"({str(tc.get('title', ''))[:60]})")
+            continue
+        cleaned.append(result)
+
+    if errors:
+        raise ValueError("Review session has invalid test cases:\n  "
+                         + "\n  ".join(errors))
+    for idx, tc in enumerate(cleaned):
+        tc['index'] = idx
+        tc['uid'] = f"{ctx['session_id']}-{idx}"
+    ctx['test_cases'] = cleaned
+    return ctx
+
+
+def _normalize_test_case(tc, ctx, n):
+    """Fill defaults, validate and guardrail one test case of a review session
+    (`n` is its 1-based number, used in messages). Returns a new dict — or
+    None when the LessonsLearned guardrails drop it — plus a list of errors."""
+    tc = dict(tc)
+    steps = tc.get('steps') or []
+    expected = tc.get('expected') or []
+    tc['steps'] = [steps] if isinstance(steps, str) else list(steps)
+    tc['expected'] = [expected] if isinstance(expected, str) else list(expected)
+    tc.setdefault('objective', '')
+    tc.setdefault('preconditions', '')
+    tc.setdefault('overall_expected', '')
+    tc.setdefault('test_type', 'Smoke & Regression')
+    tc.setdefault('test_category', 'Functional')
+    tc.setdefault('review_status', 'NO')
+    tc.setdefault('automation_state', 'Non-Automatable')
+    tc.setdefault('area_path', ctx.get('area_path', ''))
+    tc.setdefault('iteration_path', ctx.get('iteration_path', ''))
+    tc.setdefault('application_name', 'EPP')
+    tc['application_module'] = tc.get('application_module') or ctx.get('application_module', '')
+    tc.setdefault('ac_ref', '')
+    tc['epp_area'] = tc.get('epp_area') or ctx.get('epp_area', '')
+
+    errors = []
+    if not str(tc.get('title') or '').strip():
+        errors.append(f"TC {n}: title is empty")
+    if not tc['steps']:
+        errors.append(f"TC {n}: has no test steps")
+    for i, step in enumerate(tc['steps'], 1):
+        if not str(step or '').strip():
+            errors.append(f"TC {n}: step {i} has no action")
+    if len(tc['expected']) > len(tc['steps']):
+        errors.append(f"TC {n}: has {len(tc['expected'])} expected results "
+                      f"but only {len(tc['steps'])} steps")
+    raw_priority = tc.get('priority', 2)
+    try:
+        tc['priority'] = int(raw_priority)
+    except (TypeError, ValueError):
+        tc['priority'] = None
+    if tc['priority'] not in (1, 2, 3, 4):
+        errors.append(f"TC {n}: priority must be 1-4 (got {raw_priority!r})")
+    if tc['test_type'] not in _VALID_TEST_TYPES:
+        errors.append(f"TC {n}: test_type {tc['test_type']!r} is not one of "
+                      f"{', '.join(_VALID_TEST_TYPES)}")
+    if tc['test_category'] not in _VALID_TEST_CATEGORIES:
+        errors.append(f"TC {n}: test_category {tc['test_category']!r} is not one of "
+                      f"{', '.join(_VALID_TEST_CATEGORIES)}")
+
+    return _apply_lessons_learned(tc), errors
+
+
+# Fields the review page's editor can change.
+_EDITABLE_TC_FIELDS = ('title', 'objective', 'preconditions', 'steps', 'expected',
+                       'overall_expected')
+
+
+def update_test_case(ctx, uid, changes):
+    """Apply an edit made in the review page's editor to one test case. The
+    edit is validated and guardrailed exactly like an edited review JSON; on
+    success the test case is updated in place (so the "Add to ADO" lookup sees
+    it) and returned. Raises KeyError for an unknown uid and ValueError with a
+    readable message for invalid content."""
+    for n, tc in enumerate(ctx['test_cases'], 1):
+        if tc.get('uid') == uid:
+            break
+    else:
+        raise KeyError(uid)
+    if tc.get('ado_id'):
+        raise ValueError(f"This test case is already in ADO as TC #{tc['ado_id']}; "
+                         f"edit it there instead.")
+    edited = dict(tc)
+    edited.update({k: changes[k] for k in _EDITABLE_TC_FIELDS if k in changes})
+    result, errors = _normalize_test_case(edited, ctx, n)
+    if errors:
+        raise ValueError('\n'.join(errors))
+    if result is None:
+        raise ValueError("The edit was blocked by the lessons-learned guardrails.")
+    tc.clear()
+    tc.update(result)
+    return tc
+
+
+def load_review_session(path):
+    """Load a review JSON written by `save_review_session` and normalize it."""
+    with open(path, 'r', encoding='utf-8') as f:
+        ctx = json.load(f)
+    missing = [k for k in ('story_id', 'area_path', 'iteration_path', 'test_cases')
+               if k not in ctx]
+    if missing:
+        raise ValueError(f"{path} is not a review session "
+                         f"(missing: {', '.join(missing)})")
+    return normalize_review_session(ctx)
+
+
+def print_test_case_list(test_cases):
+    """Print the numbered test case list. These 1-based numbers are what
+    `--select` refers to."""
+    for i, tc in enumerate(test_cases, 1):
+        pushed = f"  (in ADO as TC #{tc['ado_id']})" if tc.get('ado_id') else ''
+        print(f"                   {i:2d}. [{str(tc.get('ac_ref', '?')):>14s}] "
+              f"{tc['title']}{pushed}")
+
+
+def _scrub_ac(s):
+    """Scrub any leftover "AC<n>" / "AC Reference" / "Acceptance Criteria"
+    tokens from a user-visible string before pushing it to ADO."""
+    if not s:
+        return s
+    s = re.sub(r'\bAC\s*Reference\b\s*[:\-]?\s*[^<\n\r]*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bAC\s*\d+\b[:\-\.\)]?\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bacceptance\s+criteri(?:on|a)\b[:\-]?\s*', '', s, flags=re.IGNORECASE)
+    # Strip internal rule-ID tags such as "(RULE FUNC 11)", "RULE GEN 01.5",
+    # "RULE COV 08 / RULE DATA 09" — these are authoring guidelines and
+    # should never appear in business-facing test case content.
+    s = re.sub(r'\(\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?(?:\s*[/,]\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?)*\s*\)',
+               '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bRULE\s+[A-Z]+\s*\d+(?:\.\d+)?\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'[ \t]{2,}', ' ', s)
+    s = re.sub(r'\s+([.,;:])', r'\1', s)  # tidy stray space before punctuation
+    return s.strip()
+
+
+def push_test_cases_to_ado(ctx, selected_tcs):
+    """Create each selected test case as an ADO Test Case work item and link
+    it to the User Story ("Tests / Tested By").
+
+    Test cases that already carry an `ado_id` (pushed earlier from the same
+    review session) are skipped, so re-running a push never creates
+    duplicates. Newly created ids are written back onto the test case dicts.
+    Returns one result dict per selected test case.
+    """
+    from xml.sax.saxutils import escape as _xml_escape
+
+    story_id = ctx['story_id']
+    area_path = ctx['area_path']
+    iteration_path = ctx['iteration_path']
+
+    results = []
+    for tc in selected_tcs:
+        sel_idx = tc.get('index', -1)
+        if tc.get('ado_id'):
+            print(f"  Skipping (already in ADO as TC #{tc['ado_id']}): {tc['title'][:70]}")
+            results.append({'index': sel_idx, 'tc_id': tc['ado_id'], 'title': tc['title'],
+                            'success': True, 'skipped': True})
+            continue
+
+        tc_title = _scrub_ac(tc['title'])  # RULE GEN 02
+        preconditions = _scrub_ac(tc.get('preconditions', ''))
+        objective = _scrub_ac(tc.get('objective', ''))
+        overall_expected = _scrub_ac(tc.get('overall_expected', ''))
+        # Scrub each step / expected as well
+        tc_steps = [_scrub_ac(s) for s in (tc.get('steps') or [])]
+        tc_expected = [_scrub_ac(e) for e in (tc.get('expected') or [])]
+
+        # ── Build Steps tab content. Objective and Preconditions are
+        #    shown ONLY in their dedicated ADO fields (System.Description
+        #    / Custom.ObjectivesandPreconditions) — NOT in the Steps tab,
+        #    to avoid duplication.
+        full_steps = list(tc_steps)
+        full_expected = list(tc_expected or [])
+
+        if overall_expected:
+            full_steps.append("Verify the overall expected outcome of the test case")
+            full_expected.append(overall_expected)
+
+        steps_xml = format_steps_as_ado_xml(full_steps, full_expected)
+
+        # ── Objective HTML → goes into System.Description (the "Summary"
+        #    box on the Test Case form, top of the page).
+        objective_html = ''
+        if objective:
+            objective_html = (
+                f"<div><b>Objective:</b><br>{html.escape(objective)}</div>"
+            )
+            # Append useful context below the objective (no "AC" labels)
+            objective_html += (
+                f"<br><div><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
+                f"<b>Module:</b> {tc.get('application_module', '')}</div>"
+                f"<div><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
+                f"<b>Category:</b> {tc.get('test_category', '')}</div>"
+            )
+
+        # ── Preconditions HTML → goes into Custom.ObjectivesandPreconditions
+        #    (the "Objectives and Preconditions" panel on the Test Case
+        #    form in this project's process template).
+        #    We render BOTH the Objective and the Preconditions in this
+        #    field, since the field name is "Objectives and Preconditions".
+        raw_pre = (preconditions or '').strip()
+        if not raw_pre:
+            raw_pre = "User is logged in to EPP with the required permissions for this functionality."
+        # Split into list items (newline first, then '; ' separator)
+        if '\n' in raw_pre:
+            items = [s.strip(' -•\t') for s in raw_pre.split('\n') if s.strip()]
+        elif '; ' in raw_pre:
+            items = [s.strip() for s in raw_pre.split('; ') if s.strip()]
+        else:
+            items = [raw_pre]
+        if len(items) > 1:
+            pre_html_block = "<ul>" + ''.join(
+                f"<li>{_xml_escape(it)}</li>" for it in items) + "</ul>"
+        else:
+            pre_html_block = f"<div>{_xml_escape(items[0])}</div>"
+
+        obj_html_block = ""
+        if objective:
+            obj_html_block = f"<div>{_xml_escape(objective)}</div>"
+
+        preconditions_field_html = (
+            (f"<p><b>Objective:</b></p>{obj_html_block}" if obj_html_block else "")
+            + f"<p><b>Preconditions:</b></p>{pre_html_block}"
+        )
+
+        # Build a rich combined Description (legacy / fallback). No "AC" labels.
+        desc_parts = []
+        if objective:
+            desc_parts.append(f"<p><b>Objective:</b><br>{html.escape(objective)}</p>")
+        if preconditions:
+            desc_parts.append(f"<p><b>Preconditions:</b><br>{html.escape(preconditions).replace(chr(10), '<br>')}</p>")
+        if overall_expected:
+            desc_parts.append(f"<p><b>Overall Expected Result:</b><br>{html.escape(overall_expected)}</p>")
+        desc_parts.append(f"<p><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
+                          f"<b>Module:</b> {tc.get('application_module', '')}</p>")
+        desc_parts.append(f"<p><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
+                          f"<b>Category:</b> {tc.get('test_category', '')}</p>")
+        desc_parts.append(f"<p><b>Review Status:</b> {tc.get('review_status', 'NO')} &mdash; "
+                          f"<b>Automation State:</b> {tc.get('automation_state', 'Non-Automatable')}</p>")
+        description_html = ''.join(desc_parts)
+
+        # Custom fields (best-effort; will be dropped if process template lacks them)
+        extra_fields = {
+            'Custom.TestType': tc.get('test_type', ''),
+            'Custom.TestCategory': tc.get('test_category', ''),
+            'Custom.ReviewStatus': tc.get('review_status', 'NO'),
+            'Custom.ApplicationName': tc.get('application_name', 'EPP'),
+            'Custom.ApplicationModule': tc.get('application_module', ''),
+            # EPP area tag (AP_Bulk / Resware_OB / Escrow_CEA / etc.)
+            # — surfaced into System.Tags by create_test_case_in_ado.
+            'X-Tag.EppArea': tc.get('epp_area', '') or '',
+        }
+
+        print(f"  Creating: {tc_title[:70]}...")
+        result = create_test_case_in_ado(
+            tc_title=tc_title,
+            steps_xml=steps_xml,
+            preconditions_html=description_html,
+            area_path=area_path,
+            iteration_path=iteration_path,
+            priority=tc.get('priority', 2),
+            automation_status='Not Automated',
+            extra_fields=extra_fields,
+            objective_html=objective_html or None,
+            preconditions_field_html=preconditions_field_html or None,
+            description_html=description_html,
+        )
+        if result:
+            tc_id = result['id']
+            tc['ado_id'] = tc_id
+            linked = link_test_case_to_story(tc_id, story_id)
+            if linked:
+                print(f"  Created TC #{tc_id} and linked to US #{story_id}")
+            else:
+                print(f"  Created TC #{tc_id} but could NOT link it to US #{story_id}")
+            results.append({'index': sel_idx, 'tc_id': tc_id, 'title': tc_title,
+                            'success': True, 'linked': linked})
+        else:
+            results.append({'index': sel_idx, 'tc_id': None, 'title': tc_title, 'success': False})
+
+    return results
+
+
+def serve_review_page(ctx, session_path=None, port=8765):
+    """Phase 5: write the review HTML and serve it on localhost so the user
+    can edit test cases inline, tick them and push them with the "Add to ADO"
+    button. Blocks until the push finishes (auto-stop) or Ctrl+C. When
+    `session_path` is given, the review JSON is updated with every saved edit
+    and with the created ADO ids after a push.
+    """
+    story_id = ctx['story_id']
+    review_html = _build_review_html(ctx)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    review_file = os.path.join(REPORTS_DIR, f"review_test_cases_US{story_id}.html")
     with open(review_file, 'w', encoding='utf-8') as f:
         f.write(review_html)
 
     # ── Local server to handle the "Add to ADO" action ─────────────────────
     server_result = {'done': False}
+    tc_data_list = ctx['test_cases']
     # Build a uid → tc lookup for stable identification (immune to re-orderings)
     tc_by_uid = {tc['uid']: tc for tc in tc_data_list}
-    current_session_id = session_id
+    current_session_id = ctx['session_id']
 
     class ReviewHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -3432,143 +3809,11 @@ def generate_and_push_test_cases(story_id):
 
                 print(f"\n  Received request to add {len(selected_tcs)} test cases to ADO...")
 
-                results = []
-                # Helper: scrub any leftover "AC<n>" / "AC Reference" / "Acceptance Criteria"
-                # tokens from any user-visible string before pushing to ADO.
-                def _scrub_ac(s):
-                    if not s:
-                        return s
-                    s = re.sub(r'\bAC\s*Reference\b\s*[:\-]?\s*[^<\n\r]*', '', s, flags=re.IGNORECASE)
-                    s = re.sub(r'\bAC\s*\d+\b[:\-\.\)]?\s*', '', s, flags=re.IGNORECASE)
-                    s = re.sub(r'\bacceptance\s+criteri(?:on|a)\b[:\-]?\s*', '', s, flags=re.IGNORECASE)
-                    # Strip internal rule-ID tags such as "(RULE FUNC 11)", "RULE GEN 01.5",
-                    # "RULE COV 08 / RULE DATA 09" — these are authoring guidelines and
-                    # should never appear in business-facing test case content.
-                    s = re.sub(r'\(\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?(?:\s*[/,]\s*RULE\s+[A-Z]+\s*\d+(?:\.\d+)?)*\s*\)',
-                               '', s, flags=re.IGNORECASE)
-                    s = re.sub(r'\bRULE\s+[A-Z]+\s*\d+(?:\.\d+)?\b', '', s, flags=re.IGNORECASE)
-                    s = re.sub(r'[ \t]{2,}', ' ', s)
-                    s = re.sub(r'\s+([.,;:])', r'\1', s)  # tidy stray space before punctuation
-                    return s.strip()
-
-                for tc in selected_tcs:
-                    sel_idx = tc.get('index', -1)
-                    tc_title = _scrub_ac(tc['title'])  # RULE GEN 02
-                    preconditions = _scrub_ac(tc.get('preconditions', ''))
-                    objective = _scrub_ac(tc.get('objective', ''))
-                    overall_expected = _scrub_ac(tc.get('overall_expected', ''))
-                    # Scrub each step / expected as well
-                    tc_steps = [_scrub_ac(s) for s in (tc.get('steps') or [])]
-                    tc_expected = [_scrub_ac(e) for e in (tc.get('expected') or [])]
-
-                    # ── Build Steps tab content. Objective and Preconditions are
-                    #    shown ONLY in their dedicated ADO fields (System.Description
-                    #    / Custom.ObjectivesandPreconditions) — NOT in the Steps tab,
-                    #    to avoid duplication.
-                    full_steps = list(tc_steps)
-                    full_expected = list(tc_expected or [])
-
-                    if overall_expected:
-                        full_steps.append("Verify the overall expected outcome of the test case")
-                        full_expected.append(overall_expected)
-
-                    steps_xml = format_steps_as_ado_xml(full_steps, full_expected)
-
-                    # ── Objective HTML → goes into System.Description (the "Summary"
-                    #    box on the Test Case form, top of the page).
-                    objective_html = ''
-                    if objective:
-                        objective_html = (
-                            f"<div><b>Objective:</b><br>{objective}</div>"
-                        )
-                        # Append useful context below the objective (no "AC" labels)
-                        objective_html += (
-                            f"<br><div><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
-                            f"<b>Module:</b> {tc.get('application_module', '')}</div>"
-                            f"<div><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
-                            f"<b>Category:</b> {tc.get('test_category', '')}</div>"
-                        )
-
-                    # ── Preconditions HTML → goes into Custom.ObjectivesandPreconditions
-                    #    (the "Objectives and Preconditions" panel on the Test Case
-                    #    form in this project's process template).
-                    #    We render BOTH the Objective and the Preconditions in this
-                    #    field, since the field name is "Objectives and Preconditions".
-                    from xml.sax.saxutils import escape as _xml_escape
-                    raw_pre = (preconditions or '').strip()
-                    if not raw_pre:
-                        raw_pre = "User is logged in to EPP with the required permissions for this functionality."
-                    # Split into list items (newline first, then '; ' separator)
-                    if '\n' in raw_pre:
-                        items = [s.strip(' -•\t') for s in raw_pre.split('\n') if s.strip()]
-                    elif '; ' in raw_pre:
-                        items = [s.strip() for s in raw_pre.split('; ') if s.strip()]
-                    else:
-                        items = [raw_pre]
-                    if len(items) > 1:
-                        pre_html_block = "<ul>" + ''.join(
-                            f"<li>{_xml_escape(it)}</li>" for it in items) + "</ul>"
-                    else:
-                        pre_html_block = f"<div>{_xml_escape(items[0])}</div>"
-
-                    obj_html_block = ""
-                    if objective:
-                        obj_html_block = f"<div>{_xml_escape(objective)}</div>"
-
-                    preconditions_field_html = (
-                        (f"<p><b>Objective:</b></p>{obj_html_block}" if obj_html_block else "")
-                        + f"<p><b>Preconditions:</b></p>{pre_html_block}"
-                    )
-
-                    # Build a rich combined Description (legacy / fallback). No "AC" labels.
-                    desc_parts = []
-                    if objective:
-                        desc_parts.append(f"<p><b>Objective:</b><br>{objective}</p>")
-                    if preconditions:
-                        desc_parts.append(f"<p><b>Preconditions:</b><br>{preconditions.replace(chr(10), '<br>')}</p>")
-                    if overall_expected:
-                        desc_parts.append(f"<p><b>Overall Expected Result:</b><br>{overall_expected}</p>")
-                    desc_parts.append(f"<p><b>Application:</b> {tc.get('application_name', 'EPP')} &mdash; "
-                                      f"<b>Module:</b> {tc.get('application_module', '')}</p>")
-                    desc_parts.append(f"<p><b>Test Type:</b> {tc.get('test_type', '')} &mdash; "
-                                      f"<b>Category:</b> {tc.get('test_category', '')}</p>")
-                    desc_parts.append(f"<p><b>Review Status:</b> {tc.get('review_status', 'NO')} &mdash; "
-                                      f"<b>Automation State:</b> {tc.get('automation_state', 'Non-Automatable')}</p>")
-                    description_html = ''.join(desc_parts)
-
-                    # Custom fields (best-effort; will be dropped if process template lacks them)
-                    extra_fields = {
-                        'Custom.TestType': tc.get('test_type', ''),
-                        'Custom.TestCategory': tc.get('test_category', ''),
-                        'Custom.ReviewStatus': tc.get('review_status', 'NO'),
-                        'Custom.ApplicationName': tc.get('application_name', 'EPP'),
-                        'Custom.ApplicationModule': tc.get('application_module', ''),
-                        # EPP area tag (AP_Bulk / Resware_OB / Escrow_CEA / etc.)
-                        # — surfaced into System.Tags by create_test_case_in_ado.
-                        'X-Tag.EppArea': tc.get('epp_area', '') or '',
-                    }
-
-                    print(f"  Creating: {tc_title[:70]}...")
-                    result = create_test_case_in_ado(
-                        tc_title=tc_title,
-                        steps_xml=steps_xml,
-                        preconditions_html=description_html,
-                        area_path=area_path,
-                        iteration_path=iteration_path,
-                        priority=tc.get('priority', 2),
-                        automation_status='Not Automated',
-                        extra_fields=extra_fields,
-                        objective_html=objective_html or None,
-                        preconditions_field_html=preconditions_field_html or None,
-                        description_html=description_html,
-                    )
-                    if result:
-                        tc_id = result['id']
-                        link_test_case_to_story(tc_id, story_id)
-                        print(f"  Created TC #{tc_id} and linked to US #{story_id}")
-                        results.append({'index': sel_idx, 'tc_id': tc_id, 'title': tc_title, 'success': True})
-                    else:
-                        results.append({'index': sel_idx, 'tc_id': None, 'title': tc_title, 'success': False})
+                try:
+                    results = push_test_cases_to_ado(ctx, selected_tcs)
+                finally:  # record created ids even if the run is interrupted
+                    if session_path:
+                        save_review_session(ctx, session_path)
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -3591,9 +3836,44 @@ def generate_and_push_test_cases(story_id):
                     except Exception:
                         pass
                 threading.Thread(target=_shutdown_later, daemon=True).start()
+            elif self.path == '/save-tc':
+                # ── Inline editor: validate + save one edited test case ──────
+                content_length = int(self.headers.get('Content-Length', 0))
+                edit = json.loads(self.rfile.read(content_length).decode('utf-8'))
+                if edit.get('session_id') != current_session_id:
+                    self._send_json(409, {
+                        'error': 'stale_session',
+                        'message': "Stale review page detected (session mismatch). "
+                                   "Please refresh the browser (Ctrl+F5) and try again."})
+                    return
+                try:
+                    tc = update_test_case(ctx, edit.get('uid', ''), edit)
+                except KeyError:
+                    self._send_json(404, {'error': 'not_found',
+                                          'message': 'Test case not found in this session.'})
+                    return
+                except ValueError as e:
+                    self._send_json(400, {'error': 'invalid', 'message': str(e)})
+                    return
+                if session_path:
+                    save_review_session(ctx, session_path)
+                # Keep the served page in sync so a browser refresh shows the edit.
+                with open(review_file, 'w', encoding='utf-8') as f:
+                    f.write(_build_review_html(ctx))
+                print(f"  Saved edit: TC {tc['index'] + 1} — {tc['title'][:70]}", flush=True)
+                self._send_json(200, {
+                    'tc': {k: tc.get(k, '') for k in _EDITABLE_TC_FIELDS},
+                    'card_html': _render_tc_card(tc)})
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        def _send_json(self, status, payload):
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self._send_no_cache_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode('utf-8'))
 
         def do_OPTIONS(self):
             self.send_response(200)
@@ -3602,11 +3882,12 @@ def generate_and_push_test_cases(story_id):
             self.send_header('Access-Control-Allow-Headers', 'Content-Type')
             self.end_headers()
 
-    port = 8765
     server = HTTPServer(('127.0.0.1', port), ReviewHandler)
 
     print(f"\n[5/5] Review page ready — opening in your browser…", flush=True)
     print(f"      URL : http://localhost:{port}/review?s={current_session_id[:8]}")
+    if session_path:
+        print(f"      JSON: {session_path}")
     print(f"      Tip : select the test cases you want, then click 'Add to ADO'.")
     print(f"            Press Ctrl+C in this terminal to stop the server.\n",
           flush=True)
@@ -3621,55 +3902,204 @@ def generate_and_push_test_cases(story_id):
         server.server_close()
 
 
-def _build_review_html(ctx):
-    """Build the review HTML page with checkboxes and the Add to ADO button."""
-    tc_cards_html = ''
-    for tc in ctx['test_cases']:
-        steps = tc['steps']
-        expected_list = tc.get('expected') or []
-        if isinstance(expected_list, str):
-            expected_list = [expected_list]
-        # Render Steps + Expected as a 2-column table (per-step expected — RULE GEN 01.5)
-        rows = ''
-        for i, step in enumerate(steps):
-            exp = expected_list[i] if i < len(expected_list) else ''
-            rows += (
-                f'<tr><td style="width:40px;text-align:center;color:#888">{i+1}</td>'
-                f'<td>{step}</td>'
-                f'<td style="color:#1565c0">{exp or "&mdash;"}</td></tr>'
-            )
-        steps_table = (
-            '<table style="width:100%;border-collapse:collapse;font-size:.95em">'
-            '<thead><tr style="background:#f0e6ff;color:#764ba2">'
-            '<th style="padding:6px 8px;text-align:center;width:40px">#</th>'
-            '<th style="padding:6px 8px;text-align:left">Action</th>'
-            '<th style="padding:6px 8px;text-align:left">Expected Result</th>'
-            '</tr></thead><tbody>' + rows + '</tbody></table>'
+def generate_and_push_test_cases(story_id, session_path=None):
+    """
+    Given a User Story ID, fetch details, generate test cases,
+    show them in a review HTML page with checkboxes, and let the user
+    push selected ones to ADO via a button click.
+    Launches a local server for the review workflow. The generated test
+    cases are also saved as a review JSON (see `save_review_session`).
+    """
+    ctx = build_review_session(story_id)
+    if not ctx:
+        return
+    session_path = save_review_session(ctx, session_path)
+    serve_review_page(ctx, session_path=session_path)
+
+
+# ── Review page inline editor ────────────────────────────────────────────────
+# Plain strings (not f-strings) so the CSS/JS braces need no escaping. The
+# page defines SESSION_ID and TC_DATA (uid -> editable fields) before this JS.
+_REVIEW_EDITOR_CSS = '''
+.edit-btn{background:var(--surface);color:var(--accent-text);border:1px solid var(--border);border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600;cursor:pointer;font-family:inherit}
+.edit-btn:hover{border-color:var(--accent)}
+.tc-card.editing{border-color:#fbc02d}
+.tc-card.editing .edit-btn{display:none}
+.tc-card.saved{border-color:var(--ok)}
+.ed-input,.ed-area{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:inherit;font-size:.95em;line-height:1.5}
+.ed-area{resize:vertical}
+.ed-input:focus,.ed-area:focus{outline:none;border-color:var(--accent)}
+.ed-hint{color:var(--muted);font-weight:400;font-size:.85em;margin-left:6px}
+.ed-steps{width:100%;border-collapse:collapse;margin-bottom:8px}
+.ed-steps th{text-align:left;padding:6px;color:var(--accent-text);background:var(--accent-soft);font-size:.9em}
+.ed-steps td{padding:4px;vertical-align:top}
+.ed-num{width:32px;text-align:center;color:var(--muted);padding-top:12px!important}
+.ed-step-btns{width:96px;white-space:nowrap}
+.ed-step-btns button,.ed-add,.ed-cancel{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:inherit}
+.ed-step-btns button{width:28px;height:28px;margin:2px 1px}
+.ed-step-btns button:hover,.ed-add:hover,.ed-cancel:hover{border-color:var(--accent)}
+.ed-add{padding:6px 14px;font-size:.9em}
+.ed-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
+.ed-cancel{padding:8px 20px;font-size:.95em}
+.ed-save{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:8px;padding:8px 26px;font-size:.95em;font-weight:600;cursor:pointer;font-family:inherit}
+.ed-save:disabled{opacity:.6;cursor:wait}
+.ed-error{color:#ef9a9a;font-size:.9em;white-space:pre-line;margin-top:6px}
+.ed-pending{display:none;color:#fbc02d;font-size:.85em;margin-right:12px}
+'''
+
+_REVIEW_EDITOR_JS = '''
+const EDITOR_HTML=
+  '<div class="tc-section"><div class="tc-label">Title</div><input class="ed-input ed-title" maxlength="255"></div>'
+ +'<div class="tc-section"><div class="tc-label">Objective</div><textarea class="ed-area ed-objective" rows="3"></textarea></div>'
+ +'<div class="tc-section"><div class="tc-label">Preconditions <span class="ed-hint">one per line</span></div><textarea class="ed-area ed-pre" rows="4"></textarea></div>'
+ +'<div class="tc-section"><div class="tc-label">Test Steps &amp; Expected Results</div>'
+ +'<table class="ed-steps"><thead><tr><th>#</th><th>Action</th><th>Expected Result</th><th></th></tr></thead><tbody></tbody></table>'
+ +'<button type="button" class="ed-add">+ Add step</button></div>'
+ +'<div class="tc-section"><div class="tc-label">Overall Expected Result</div><textarea class="ed-area ed-overall" rows="2"></textarea></div>'
+ +'<div class="ed-error"></div>'
+ +'<div class="ed-actions"><button type="button" class="ed-cancel">Cancel</button><button type="button" class="ed-save">Save</button></div>';
+
+function cardFor(uid){return document.querySelector('.tc-card[data-uid="'+uid+'"]');}
+
+function stepRow(action,expected){
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td class="ed-num"></td>'
+    +'<td><textarea class="ed-area ed-action" rows="2" placeholder="Action"></textarea></td>'
+    +'<td><textarea class="ed-area ed-expected" rows="2" placeholder="Expected result"></textarea></td>'
+    +'<td class="ed-step-btns">'
+    +'<button type="button" data-act="up" title="Move up">&#9650;</button>'
+    +'<button type="button" data-act="down" title="Move down">&#9660;</button>'
+    +'<button type="button" data-act="del" title="Remove step">&#10005;</button></td>';
+  tr.querySelector('.ed-action').value=action||'';
+  tr.querySelector('.ed-expected').value=expected||'';
+  return tr;
+}
+function renumber(tbody){Array.from(tbody.rows).forEach((r,i)=>{r.cells[0].textContent=i+1;});}
+
+function editTC(uid){
+  const card=cardFor(uid);
+  if(!card||card.classList.contains('editing'))return;
+  const tc=TC_DATA[uid];
+  const body=card.querySelector('.tc-body');
+  card._viewHtml=body.innerHTML;
+  card.classList.add('editing');
+  body.innerHTML=EDITOR_HTML;
+  body.querySelector('.ed-title').value=tc.title||'';
+  body.querySelector('.ed-objective').value=tc.objective||'';
+  body.querySelector('.ed-pre').value=tc.preconditions||'';
+  body.querySelector('.ed-overall').value=tc.overall_expected||'';
+  const tbody=body.querySelector('.ed-steps tbody');
+  (tc.steps||[]).forEach((s,i)=>tbody.appendChild(stepRow(s,(tc.expected||[])[i])));
+  renumber(tbody);
+  tbody.addEventListener('click',e=>{
+    const btn=e.target.closest('button');if(!btn)return;
+    const tr=btn.closest('tr');
+    if(btn.dataset.act==='up'&&tr.previousElementSibling)tbody.insertBefore(tr,tr.previousElementSibling);
+    if(btn.dataset.act==='down'&&tr.nextElementSibling)tbody.insertBefore(tr.nextElementSibling,tr);
+    if(btn.dataset.act==='del')tr.remove();
+    renumber(tbody);
+  });
+  body.querySelector('.ed-add').addEventListener('click',()=>{
+    const tr=stepRow('','');tbody.appendChild(tr);renumber(tbody);tr.querySelector('.ed-action').focus();
+  });
+  body.querySelector('.ed-cancel').addEventListener('click',()=>cancelEdit(uid));
+  body.querySelector('.ed-save').addEventListener('click',()=>saveTC(uid));
+  body.querySelector('.ed-title').focus();
+  updateCount();
+}
+
+function cancelEdit(uid){
+  const card=cardFor(uid);if(!card)return;
+  card.querySelector('.tc-body').innerHTML=card._viewHtml;
+  card.classList.remove('editing');
+  updateCount();
+}
+
+function saveTC(uid){
+  const card=cardFor(uid);const body=card.querySelector('.tc-body');
+  const err=body.querySelector('.ed-error');const btn=body.querySelector('.ed-save');
+  const rows=Array.from(body.querySelectorAll('.ed-steps tbody tr'))
+    .map(r=>[r.querySelector('.ed-action').value.trim(),r.querySelector('.ed-expected').value.trim()])
+    .filter(r=>r[0]||r[1]);
+  const payload={session_id:SESSION_ID,uid:uid,
+    title:body.querySelector('.ed-title').value.trim(),
+    objective:body.querySelector('.ed-objective').value.trim(),
+    preconditions:body.querySelector('.ed-pre').value.trim(),
+    steps:rows.map(r=>r[0]),expected:rows.map(r=>r[1]),
+    overall_expected:body.querySelector('.ed-overall').value.trim()};
+  err.textContent='';btn.disabled=true;btn.textContent='Saving...';
+  fetch('/save-tc',{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',body:JSON.stringify(payload)})
+  .then(r=>r.json().then(d=>({status:r.status,d:d})))
+  .then(({status,d})=>{
+    if(status===409){alert(d.message||'This review page is stale. Please reload (Ctrl+F5).');location.reload();return;}
+    if(status!==200){err.textContent=d.message||'Save failed';btn.disabled=false;btn.textContent='Save';return;}
+    TC_DATA[uid]=d.tc;
+    const wasChecked=card.querySelector('input[type=checkbox]').checked;
+    const tmp=document.createElement('div');tmp.innerHTML=d.card_html.trim();
+    const fresh=tmp.firstElementChild;
+    card.replaceWith(fresh);
+    const cb=fresh.querySelector('input[type=checkbox]');
+    cb.checked=wasChecked;cb.addEventListener('change',updateCount);
+    fresh.classList.add('saved');setTimeout(()=>fresh.classList.remove('saved'),1500);
+    updateCount();
+  })
+  .catch(e=>{err.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Save';});
+}
+'''
+
+
+def _render_tc_card(tc):
+    """Render one test case card of the review page. Also used by the review
+    server to re-render a card after it is edited and saved."""
+    esc = html.escape  # test case text is plain text (see Lesson 5)
+    steps = tc['steps']
+    expected_list = tc.get('expected') or []
+    if isinstance(expected_list, str):
+        expected_list = [expected_list]
+    # Render Steps + Expected as a 2-column table (per-step expected — RULE GEN 01.5)
+    rows = ''
+    for i, step in enumerate(steps):
+        exp = expected_list[i] if i < len(expected_list) else ''
+        rows += (
+            f'<tr><td style="width:40px;text-align:center;color:var(--muted)">{i+1}</td>'
+            f'<td>{esc(step)}</td>'
+            f'<td style="color:var(--expected)">{esc(exp) or "&mdash;"}</td></tr>'
         )
+    steps_table = (
+        '<table class="steps" style="width:100%;border-collapse:collapse;font-size:.95em">'
+        '<thead><tr style="background:var(--accent-soft);color:var(--accent-text)">'
+        '<th style="padding:6px 8px;text-align:center;width:40px">#</th>'
+        '<th style="padding:6px 8px;text-align:left">Action</th>'
+        '<th style="padding:6px 8px;text-align:left">Expected Result</th>'
+        '</tr></thead><tbody>' + rows + '</tbody></table>'
+    )
 
-        priority = tc.get('priority', 2)
-        test_type = tc.get('test_type', 'Smoke & Regression')
-        test_category = tc.get('test_category', 'Functional')
-        ac_ref = tc.get('ac_ref', '')
-        objective = tc.get('objective', '')
-        app_module = tc.get('application_module', '')
-        epp_area = tc.get('epp_area', '')
-        # Priority 1 = Highest (red)…4 = Lowest (green)
-        pri_color = {1: '#e53935', 2: '#fb8c00', 3: '#fdd835', 4: '#43a047'}.get(priority, '#888')
-        cat_color = {'API': '#1976d2', 'Functional': '#667eea', 'Negative': '#d32f2f'}.get(test_category, '#667eea')
-        # EPP area badge colours — each domain area gets its own colour for fast visual filtering
-        area_color = {
-            'AP_Bulk':    '#00897b',  # teal
-            'AP_WD':      '#5e35b1',  # purple
-            'AP_Portal':  '#3949ab',  # indigo
-            'STEPS_OB':   '#d81b60',  # pink
-            'Resware_OB': '#c62828',  # red
-            'Escrow_OB':  '#ef6c00',  # orange
-            'Escrow_IB':  '#2e7d32',  # green
-            'Escrow_CEA': '#1565c0',  # blue
-        }.get(epp_area, '#616161')
+    priority = tc.get('priority', 2)
+    test_type = esc(tc.get('test_type', 'Smoke & Regression'))
+    test_category = tc.get('test_category', 'Functional')
+    ac_ref = esc(tc.get('ac_ref', ''))
+    objective = esc(tc.get('objective', ''))
+    preconditions = esc(tc.get('preconditions', '')).replace(chr(10), '<br>')
+    overall_expected = esc(tc.get('overall_expected', ''))
+    app_module = esc(tc.get('application_module', ''))
+    epp_area = esc(tc.get('epp_area', ''))
+    # Priority 1 = Highest (red)…4 = Lowest (green)
+    pri_color = {1: '#e53935', 2: '#fb8c00', 3: '#fdd835', 4: '#43a047'}.get(priority, '#888')
+    pri_text = '#1a1a1a' if priority == 3 else '#fff'  # white is unreadable on yellow
+    cat_color = {'API': '#1976d2', 'Functional': '#667eea', 'Negative': '#d32f2f'}.get(test_category, '#667eea')
+    # EPP area badge colours — each domain area gets its own colour for fast visual filtering
+    area_color = {
+        'AP_Bulk':    '#00897b',  # teal
+        'AP_WD':      '#5e35b1',  # purple
+        'AP_Portal':  '#3949ab',  # indigo
+        'STEPS_OB':   '#d81b60',  # pink
+        'Resware_OB': '#c62828',  # red
+        'Escrow_OB':  '#ef6c00',  # orange
+        'Escrow_IB':  '#2e7d32',  # green
+        'Escrow_CEA': '#1565c0',  # blue
+    }.get(epp_area, '#616161')
 
-        tc_cards_html += f'''
+    return f'''
         <div class="tc-card" data-index="{tc['index']}" data-uid="{tc['uid']}">
             <div class="tc-header">
                 <label class="tc-checkbox">
@@ -3677,23 +4107,24 @@ def _build_review_html(ctx):
                     <span class="checkmark"></span>
                 </label>
                 <span class="tc-number">TC {tc['index']+1}</span>
-                <span class="tc-title">{tc['title']}</span>
+                <span class="tc-title">{esc(tc['title'])}</span>
                 <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
-                    <span style="background:{pri_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">P{priority}</span>
+                    <span style="background:{pri_color};color:{pri_text};border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">P{priority}</span>
                     <span style="background:#667eea;color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_type}</span>
-                    <span style="background:{cat_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{test_category}</span>
+                    <span style="background:{cat_color};color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600">{esc(test_category)}</span>
                     {"<span style='background:" + area_color + ";color:#fff;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:700;letter-spacing:.3px'>" + epp_area + "</span>" if epp_area else ""}
-                    {"<span style='background:#f0e6ff;color:#764ba2;border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600'>" + ac_ref + "</span>" if ac_ref else ""}
+                    {"<span style='background:var(--accent-soft);color:var(--accent-text);border-radius:8px;padding:2px 10px;font-size:.78em;font-weight:600'>" + ac_ref + "</span>" if ac_ref else ""}
+                    <button type="button" class="edit-btn" onclick="editTC('{tc['uid']}')">&#9998; Edit</button>
                 </span>
             </div>
             <div class="tc-body">
                 <div class="tc-section">
                     <div class="tc-label">Objective</div>
-                    <div class="tc-content">{objective if objective else '<span class="na">N/A</span>'}</div>
+                    <div class="tc-content">{objective or '<span class="na">N/A</span>'}</div>
                 </div>
                 <div class="tc-section">
                     <div class="tc-label">Preconditions</div>
-                    <div class="tc-content">{tc['preconditions'].replace(chr(10), '<br>') if tc['preconditions'] else '<span class="na">N/A</span>'}</div>
+                    <div class="tc-content">{preconditions or '<span class="na">N/A</span>'}</div>
                 </div>
                 <div class="tc-section">
                     <div class="tc-label">Test Steps &amp; Expected Results</div>
@@ -3701,16 +4132,28 @@ def _build_review_html(ctx):
                 </div>
                 <div class="tc-section">
                     <div class="tc-label">Overall Expected Result</div>
-                    <div class="tc-content">{tc.get('overall_expected', '') if tc.get('overall_expected') else '<span class="na">N/A</span>'}</div>
+                    <div class="tc-content">{overall_expected or '<span class="na">N/A</span>'}</div>
                 </div>
                 <div class="tc-section" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
-                    <div><div class="tc-label">Application</div><div class="tc-content">{tc.get('application_name','EPP')}</div></div>
+                    <div><div class="tc-label">Application</div><div class="tc-content">{esc(tc.get('application_name', 'EPP'))}</div></div>
                     <div><div class="tc-label">Module</div><div class="tc-content">{app_module or '<span class="na">N/A</span>'}</div></div>
-                    <div><div class="tc-label">Review Status</div><div class="tc-content">{tc.get('review_status','NO')}</div></div>
-                    <div><div class="tc-label">Automation State</div><div class="tc-content">{tc.get('automation_state','Non-Automatable')}</div></div>
+                    <div><div class="tc-label">Review Status</div><div class="tc-content">{esc(tc.get('review_status', 'NO'))}</div></div>
+                    <div><div class="tc-label">Automation State</div><div class="tc-content">{esc(tc.get('automation_state', 'Non-Automatable'))}</div></div>
                 </div>
             </div>
         </div>'''
+
+
+def _build_review_html(ctx):
+    """Build the review HTML page with checkboxes, the inline editor and the
+    Add to ADO button."""
+    tc_cards_html = ''.join(_render_tc_card(tc) for tc in ctx['test_cases'])
+    # Editable fields for the inline editor, embedded as JSON ("</" escaped so
+    # no field value can close the <script> element).
+    tc_data_json = json.dumps(
+        {tc['uid']: {k: tc.get(k, '') for k in _EDITABLE_TC_FIELDS}
+         for tc in ctx['test_cases']},
+        ensure_ascii=False).replace('</', '<\\/')
 
     # Parse AC list for display
     ac_items_html = ''
@@ -3784,76 +4227,86 @@ def _build_review_html(ctx):
 <title>Review Test Cases - US #{ctx['story_id']}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+/* Dark theme palette */
+:root{{
+  --bg:#0f1117;--surface:#181b24;--surface-2:#1f2330;--border:#2c3142;
+  --text:#e4e6eb;--muted:#9aa0ac;--faint:#5c6270;
+  --accent:#8b9cf7;--accent-2:#b39ddb;--accent-soft:#262a40;--accent-text:#c5b3ff;
+  --expected:#82b1ff;--ok:#66bb6a;--ok-soft:rgba(67,160,71,.16);--fail-soft:rgba(229,57,53,.16);
+}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh}}
-.top-bar{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;padding:28px 0;text-align:center}}
+body{{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;color-scheme:dark}}
+.top-bar{{background:linear-gradient(135deg,#4c56c0 0%,#5b3a8a 100%);color:#fff;padding:28px 0;text-align:center}}
 .top-bar h1{{font-size:1.7em;font-weight:700}}
 .top-bar .sub{{opacity:.8;margin-top:6px;font-size:1em}}
 .container{{max-width:1060px;margin:-20px auto 40px;padding:0 20px}}
 
-.info-panel{{background:#fff;border-radius:14px;padding:24px 28px;margin-bottom:22px;box-shadow:0 4px 16px rgba(0,0,0,.06)}}
-.info-panel h2{{font-size:1.15em;color:#764ba2;margin-bottom:12px;border-bottom:2px solid #f0e6ff;padding-bottom:8px}}
+.info-panel{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px 28px;margin-bottom:22px;box-shadow:0 4px 16px rgba(0,0,0,.35)}}
+.info-panel h2{{font-size:1.15em;color:var(--accent-2);margin-bottom:12px;border-bottom:2px solid var(--border);padding-bottom:8px}}
 .info-row{{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:8px}}
-.info-row .lbl{{font-weight:600;color:#555;min-width:100px}}
-.info-row .val{{color:#222}}
+.info-row .lbl{{font-weight:600;color:var(--muted);min-width:100px}}
+.info-row .val{{color:var(--text)}}
 
-.ac-item{{background:#f8f9ff;border-left:4px solid #667eea;border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:.95em}}
-.ac-num{{background:#667eea;color:#fff;border-radius:50%;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;font-size:.8em;font-weight:700;margin-right:10px}}
+.ac-item{{background:var(--surface-2);border-left:4px solid var(--accent);border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:.95em}}
+.ac-num{{background:var(--accent);color:var(--bg);border-radius:50%;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;font-size:.8em;font-weight:700;margin-right:10px}}
 
-.toolbar{{background:#fff;border-radius:14px;padding:18px 28px;margin-bottom:22px;box-shadow:0 4px 16px rgba(0,0,0,.06);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}}
+.toolbar{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 28px;margin-bottom:22px;box-shadow:0 4px 16px rgba(0,0,0,.35);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}}
 .toolbar .left{{display:flex;gap:14px;align-items:center}}
-.toolbar .count{{font-size:.95em;color:#666}}
-.select-btns button{{background:#f0f2f5;border:1px solid #ddd;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:.9em;transition:background .2s}}
-.select-btns button:hover{{background:#e8eaf0}}
+.toolbar .count{{font-size:.95em;color:var(--muted)}}
+.toolbar .count strong{{color:var(--text)}}
+.select-btns button{{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 14px;cursor:pointer;font-size:.9em;transition:background .2s}}
+.select-btns button:hover{{background:#2a2f3f}}
 
 .add-btn{{background:linear-gradient(135deg,#43a047,#2e7d32);color:#fff;border:none;border-radius:12px;padding:14px 36px;font-size:1.1em;font-weight:600;cursor:pointer;transition:transform .2s,box-shadow .2s;box-shadow:0 4px 16px rgba(46,125,50,.3)}}
 .add-btn:hover{{transform:translateY(-2px);box-shadow:0 8px 28px rgba(46,125,50,.4)}}
 .add-btn:disabled{{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}}
 
-.tc-card{{background:#fff;border-radius:14px;padding:0;margin-bottom:18px;box-shadow:0 4px 16px rgba(0,0,0,.06);overflow:hidden;transition:box-shadow .2s;border:2px solid transparent}}
-.tc-card.checked{{border-color:#667eea}}
-.tc-card.unchecked{{opacity:.55}}
-.tc-header{{display:flex;align-items:center;gap:14px;padding:18px 24px;background:#f8f9ff;border-bottom:1px solid #f0f1f5;cursor:pointer}}
+.tc-card{{background:var(--surface);border-radius:14px;padding:0;margin-bottom:18px;box-shadow:0 4px 16px rgba(0,0,0,.35);overflow:hidden;transition:box-shadow .2s;border:2px solid var(--border)}}
+.tc-card.checked{{border-color:var(--accent)}}
+.tc-card.unchecked{{opacity:.5}}
+.tc-header{{display:flex;align-items:center;gap:14px;padding:18px 24px;background:var(--surface-2);border-bottom:1px solid var(--border);cursor:pointer}}
 .tc-checkbox{{position:relative;display:flex;align-items:center}}
-.tc-checkbox input{{width:20px;height:20px;accent-color:#667eea;cursor:pointer}}
+.tc-checkbox input{{width:20px;height:20px;accent-color:var(--accent);cursor:pointer}}
 .tc-number{{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border-radius:8px;padding:5px 12px;font-weight:700;font-size:.9em;white-space:nowrap}}
-.tc-title{{font-size:1.05em;font-weight:600;color:#2c3e50}}
+.tc-title{{font-size:1.05em;font-weight:600;color:var(--text)}}
 .tc-body{{padding:20px 24px}}
 .tc-section{{margin-bottom:14px}}
 .tc-section:last-child{{margin-bottom:0}}
-.tc-label{{font-weight:600;color:#764ba2;font-size:.92em;margin-bottom:6px}}
-.tc-content{{background:#f8f9ff;border-radius:8px;padding:12px 16px;border:1px solid #f0e6ff;font-size:.95em;line-height:1.6}}
+.tc-label{{font-weight:600;color:var(--accent-2);font-size:.92em;margin-bottom:6px}}
+.tc-content{{background:var(--surface-2);border-radius:8px;padding:12px 16px;border:1px solid var(--border);font-size:.95em;line-height:1.6}}
 .tc-content ul{{margin:0;padding-left:20px}}
 .tc-content li{{margin-bottom:6px}}
-.na{{color:#bbb}}
+.steps td{{padding:6px 8px;border-top:1px solid var(--border);vertical-align:top}}
+.na{{color:var(--faint)}}
 
-.result-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center}}
+.result-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;align-items:center;justify-content:center}}
 .result-overlay.show{{display:flex}}
-.result-box{{background:#fff;border-radius:16px;padding:36px 44px;max-width:600px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.2);text-align:center}}
-.result-box h2{{color:#2e7d32;margin-bottom:16px}}
+.result-box{{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:16px;padding:36px 44px;max-width:600px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.6);text-align:center}}
+.result-box h2{{color:var(--ok);margin-bottom:16px}}
 .result-list{{text-align:left;margin:16px 0}}
 .result-item{{padding:8px 12px;border-radius:8px;margin-bottom:6px;display:flex;align-items:center;gap:10px}}
-.result-item.ok{{background:#e8f5e9}}
-.result-item.fail{{background:#ffebee}}
+.result-item.ok{{background:var(--ok-soft)}}
+.result-item.fail{{background:var(--fail-soft)}}
 .close-btn{{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;padding:10px 28px;font-size:1em;cursor:pointer;margin-top:14px}}
 
-.spinner{{display:none;width:24px;height:24px;border:3px solid #ccc;border-top-color:#2e7d32;border-radius:50%;animation:spin .8s linear infinite;margin-left:12px}}
+.spinner{{display:none;width:24px;height:24px;border:3px solid var(--border);border-top-color:var(--ok);border-radius:50%;animation:spin .8s linear infinite;margin-left:12px}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
 
 /* ── Historical context panel (RULE HIST 15) ───────────────────────── */
-.history-panel{{border-left:4px solid #764ba2;background:linear-gradient(180deg,#fff,#faf7ff)}}
-.history-panel h2{{color:#764ba2}}
-.hp-sub{{color:#555;font-size:.92em;margin-bottom:10px}}
-.hp-summary{{display:inline-block;background:#f0e6ff;color:#4527a0;border-radius:8px;padding:4px 12px;font-size:.85em;font-weight:600;margin-bottom:12px}}
-.hp-section-label{{font-weight:600;color:#764ba2;font-size:.9em;margin:14px 0 6px}}
+.history-panel{{border-left:4px solid var(--accent-2);background:var(--surface)}}
+.history-panel h2{{color:var(--accent-2)}}
+.hp-sub{{color:var(--muted);font-size:.92em;margin-bottom:10px}}
+.hp-summary{{display:inline-block;background:var(--accent-soft);color:var(--accent-text);border-radius:8px;padding:4px 12px;font-size:.85em;font-weight:600;margin-bottom:12px}}
+.hp-section-label{{font-weight:600;color:var(--accent-2);font-size:.9em;margin:14px 0 6px}}
 .hk-list{{display:flex;flex-wrap:wrap;gap:6px}}
-.hk-chip{{background:#fff;color:#4527a0;border:1px solid #d1c4e9;border-radius:14px;padding:3px 10px;font-size:.82em;font-weight:600}}
+.hk-chip{{background:var(--surface-2);color:var(--accent-text);border:1px solid #3a3456;border-radius:14px;padding:3px 10px;font-size:.82em;font-weight:600}}
 .hn-list{{display:flex;flex-direction:column;gap:6px}}
-.hn-row{{display:grid;grid-template-columns:70px 1fr auto auto;gap:10px;align-items:center;background:#fff;border:1px solid #ede7f6;border-radius:8px;padding:6px 12px;font-size:.9em}}
-.hn-id{{color:#764ba2;font-weight:700}}
-.hn-title{{color:#222;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.hn-state{{background:#e8f5e9;color:#2e7d32;border-radius:6px;padding:2px 8px;font-size:.78em;font-weight:600}}
-.hn-tags{{color:#999;font-size:.78em}}
+.hn-row{{display:grid;grid-template-columns:70px 1fr auto auto;gap:10px;align-items:center;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:.9em}}
+.hn-id{{color:var(--accent-2);font-weight:700}}
+.hn-title{{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.hn-state{{background:var(--ok-soft);color:#81c784;border-radius:6px;padding:2px 8px;font-size:.78em;font-weight:600}}
+.hn-tags{{color:var(--muted);font-size:.78em;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+{_REVIEW_EDITOR_CSS}
 </style>
 </head>
 <body>
@@ -3885,6 +4338,7 @@ body{{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height
             </span>
         </div>
         <div>
+            <span class="ed-pending" id="editPending">Save or cancel your edits before adding to ADO</span>
             <button class="add-btn" id="addBtn" onclick="addToADO()">Add to ADO</button>
             <span class="spinner" id="spinner"></span>
         </div>
@@ -3903,6 +4357,8 @@ body{{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height
 </div>
 
 <script>
+const SESSION_ID='{ctx['session_id']}';
+const TC_DATA={tc_data_json};
 function updateCount(){{
     const boxes=document.querySelectorAll('.tc-card input[type=checkbox]');
     let c=0;
@@ -3912,8 +4368,12 @@ function updateCount(){{
         else{{card.classList.remove('checked');card.classList.add('unchecked')}}
     }});
     document.getElementById('checkedCount').textContent=c;
-    document.getElementById('addBtn').disabled=c===0;
+    // Unsaved edits would not be pushed, so block Add to ADO while editing.
+    const editing=document.querySelector('.tc-card.editing')!==null;
+    document.getElementById('addBtn').disabled=c===0||editing;
+    document.getElementById('editPending').style.display=editing?'inline':'none';
 }}
+{_REVIEW_EDITOR_JS}
 function selectAll(){{document.querySelectorAll('.tc-card input[type=checkbox]').forEach(b=>b.checked=true);updateCount()}}
 function deselectAll(){{document.querySelectorAll('.tc-card input[type=checkbox]').forEach(b=>b.checked=false);updateCount()}}
 document.querySelectorAll('.tc-card input[type=checkbox]').forEach(b=>b.addEventListener('change',updateCount));
@@ -3988,12 +4448,113 @@ def debug_work_item(work_item_id):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _parse_selection(spec, count):
+    """Parse a --select list such as "1,3,5-7" into sorted 1-based test case
+    numbers, rejecting anything outside 1..count."""
+    numbers = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if '-' in part:
+                lo, hi = part.split('-', 1)
+                numbers.update(range(int(lo), int(hi) + 1))
+            else:
+                numbers.add(int(part))
+        except ValueError:
+            raise ValueError(f"invalid --select entry {part!r} (use e.g. 1,3,5-7)")
+    bad = sorted(n for n in numbers if not 1 <= n <= count)
+    if bad:
+        raise ValueError(f"test case number(s) out of range 1-{count}: "
+                         f"{', '.join(map(str, bad))}")
+    if not numbers:
+        raise ValueError("--select is empty")
+    return sorted(numbers)
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Azure DevOps Advisor & AI Test Case Generator. With no "
+                    "arguments, prints the advisor recommendations and writes "
+                    "the sprint report.")
+    parser.add_argument('story_id', nargs='?', type=int,
+                        help="User Story ID: generate its test cases and open "
+                             "the browser review page")
+    # One mode per run, so e.g. a `--json` invocation can never also push.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--json', action='store_true',
+                      help="with STORY_ID: only generate and save the review "
+                           "JSON (no browser / local server)")
+    mode.add_argument('--check', metavar='FILE',
+                      help="re-validate an edited review JSON in place and "
+                           "list its test cases")
+    mode.add_argument('--review', metavar='FILE',
+                      help="open the browser review page for a saved review JSON")
+    mode.add_argument('--push', metavar='FILE',
+                      help="create test cases from a review JSON in ADO "
+                           "(requires --select or --all)")
+    parser.add_argument('--out', metavar='FILE',
+                        help="review JSON path (default: reports/test_cases_US<ID>.json)")
+    parser.add_argument('--select', metavar='LIST',
+                        help="test case numbers to push, e.g. 1,3,5-7")
+    parser.add_argument('--all', action='store_true',
+                        help="push every test case in the review JSON")
+    args = parser.parse_args()
+    if args.json and args.story_id is None:
+        parser.error("--json needs a STORY_ID")
+    if args.push and not (args.select or args.all):
+        parser.error("--push needs --select <numbers> or --all")
+    if (args.select or args.all) and not args.push:
+        parser.error("--select / --all only apply to --push")
+    if args.story_id is not None and (args.check or args.review or args.push):
+        parser.error("STORY_ID can't be combined with --check / --review / --push")
+
     try:
-        # If a user story ID is passed as argument, generate and push test cases
-        if len(sys.argv) > 1 and sys.argv[1].isdigit():
-            story_id = int(sys.argv[1])
-            generate_and_push_test_cases(story_id)
+        if args.push:
+            ctx = load_review_session(args.push)
+            tcs = ctx['test_cases']
+            chosen = (tcs if args.all else
+                      [tcs[n - 1] for n in _parse_selection(args.select, len(tcs))])
+            print(f"\n  Pushing {len(chosen)} test case(s) to ADO for "
+                  f"US #{ctx['story_id']}...")
+            try:
+                results = push_test_cases_to_ado(ctx, chosen)
+            finally:  # record created ids even if the run is interrupted
+                save_review_session(ctx, args.push)
+            failed = [r for r in results if not r['success']]
+            print(f"\n  Done: {len(results) - len(failed)}/{len(results)} "
+                  f"test case(s) are in ADO.")
+            if failed:
+                sys.exit(1)
+            return
+
+        if args.check:
+            ctx = load_review_session(args.check)
+            save_review_session(ctx, args.check)
+            print(f"  {args.check}: {len(ctx['test_cases'])} valid test case(s) "
+                  f"for US #{ctx['story_id']}")
+            print_test_case_list(ctx['test_cases'])
+            return
+
+        if args.review:
+            serve_review_page(load_review_session(args.review),
+                              session_path=args.review)
+            return
+
+        if args.story_id is not None:
+            if not args.json:
+                generate_and_push_test_cases(args.story_id, session_path=args.out)
+                return
+            ctx = build_review_session(args.story_id)
+            if not ctx:
+                sys.exit(1)
+            path = save_review_session(ctx, args.out)
+            print(f"\n[5/5] Review JSON saved — {path}")
+            print(f"      Next : python test/ado_advisor.py --review \"{path}\"   (browser review)")
+            print(f"             python test/ado_advisor.py --push \"{path}\" --select 1,2   "
+                  f"(push chosen TCs)", flush=True)
             return
 
         print(f"Checking project: {ADO_PROJECT}")

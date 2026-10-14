@@ -18,6 +18,11 @@ python test/ado_advisor.py <USER_STORY_ID>
 python test/ado_advisor.py 432288
 ```
 
+**With Claude** (Claude Code CLI or VS Code chat): run `/generate-test-cases 432288`.
+Claude runs the same generator, reviews and refines the test cases against
+[Rules.md](Rules.md), and pushes only the ones you choose. See
+[README.md → Using with Claude](README.md#using-with-claude).
+
 ---
 
 ## Step-by-Step Workflow
@@ -46,6 +51,12 @@ The review page displays:
 - **User Story details** — ID, title, state, assignee, description
 - **Acceptance Criteria** — parsed and numbered
 - **Generated Test Cases** — each as a card with a **checkbox** (all checked by default)
+- **✎ Edit button** on every card — opens an inline editor for the title, objective,
+  preconditions (one per line), test steps & expected results (add, remove and
+  reorder steps) and overall expected result. **Save** validates the edit with the
+  same rules as generation (e.g. titles start with "Verify", every step needs an
+  action) and stores it in `reports/test_cases_US<ID>.json`; **Cancel** discards it.
+  "Add to ADO" is disabled while an edit is open, so only saved content is pushed.
 - **Select All / Deselect All** buttons
 - **Counter** — shows how many test cases are selected
 - **"Add to ADO" button** — pushes selected test cases to Azure DevOps

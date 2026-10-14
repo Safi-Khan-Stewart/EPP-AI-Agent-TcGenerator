@@ -1,1 +1,4 @@
 requests
+jinja2
+fpdf
+mcp>=2.3,<3

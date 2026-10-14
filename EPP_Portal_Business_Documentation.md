@@ -1653,11 +1653,12 @@ The "My Payments" tab is only shown to `FieldUser` in the navigation, but the un
 **Source of truth:** Actual TypeScript/C# source code — no assumptions made
 
 
+
 ---
 
 # 📦 Business Domain — Source-Code Derived
 
-*Auto-generated 2026-09-15 by `test/_probe_repo_domain.py` from the following Azure DevOps repositories in `StewartTitle/Enterprise Payments`.*
+*Auto-generated 2026-10-14 by `test/_probe_repo_domain.py` from the following Azure DevOps repositories in `StewartTitle/Enterprise Payments`.*
 
 This section is a **fact-based snapshot** of the code base (controllers, routes, DTOs, enums, README summaries). It is meant as an evidence layer supporting the human-authored business documentation above, not a replacement for it.
 
@@ -1678,12 +1679,12 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
 
 ### `Epp.Admin`
 
-- **Files scanned:** 573
-- **Projects (`*.csproj`):** `Epp.Admin`, `Epp.Admin.Shared`
+- **Files scanned:** 603
+- **Projects (`*.csproj`):** `Epp.Admin`, `Epp.Admin.Shared`, `Epp.Admin.Shared.Tests`
 - **Root namespaces:** `Epp.Admin.Api`, `Epp.Admin.Projections.Api`, `Epp.Admin.Projections.Api.Models`, `Epp.Admin.Webhooks.Api`
-- **Controllers (42):** `AccountController`, `AccountingRequestProjectionController`, `BulkPaymentProjectionController`, `BulkPaymentsController`, `BusinessUnitAccountController`, `BusinessUnitController`, `BusinessUnitPaymentAccountController`, `FundingRequestController`, `FundingRequstProjectionController`, `FundsDisbursementController`, `FundsDisbursementProjectionController`, `FundsTransferController`, `FundsTransferProjectionController`, `KnownConnectedSystemController`, `MetricsController`, `OnboardingTokenAssociationController`, `OnboardingTokenController`, `OperationsController`, `PartyAccountController`, `PartyConnectedSystemAssociationController`, `PartyController`, `PartyProjectionController`, `PartyUserAccessTokenController`, `PartyUserConnectedSystemAssociationController`, `PartyUserController`
-- **Base routes:** `api/Accounts`, `api/Accounts/Stripe`, `api/Accounts/Stripe/Actions`, `api/FundingRequest/Stripe`, `api/FundingRequests`, `api/FundsDisbursements`, `api/FundsTransfers`, `api/Onboarding/Token`, `api/Onboarding/TokenAssociation`, `api/Operations/BusinessUnits`, `api/Operations/KnownConnectedSystem`, `api/Parties`, `api/Parties/Accounts`, `api/Parties/ConnectedSystemAssociations`, `api/Parties/UserAssociations`
-- **Sample HTTP endpoints (40):**
+- **Controllers (43):** `AccountController`, `AccountingRequestController`, `AccountingRequestProjectionController`, `BulkPaymentProjectionController`, `BulkPaymentsController`, `BusinessUnitAccountController`, `BusinessUnitController`, `BusinessUnitPaymentAccountController`, `FundingRequestController`, `FundingRequstProjectionController`, `FundsDisbursementController`, `FundsDisbursementProjectionController`, `FundsTransferController`, `FundsTransferProjectionController`, `KnownConnectedSystemController`, `MetricsController`, `OnboardingTokenAssociationController`, `OnboardingTokenController`, `OperationsController`, `PartyAccountController`, `PartyConnectedSystemAssociationController`, `PartyController`, `PartyProjectionController`, `PartyUserAccessTokenController`, `PartyUserConnectedSystemAssociationController`
+- **Base routes:** `api/AccountingRequest`, `api/Accounts`, `api/Accounts/Stripe`, `api/Accounts/Stripe/Actions`, `api/FundingRequest/Stripe`, `api/FundingRequests`, `api/FundsDisbursements`, `api/FundsTransfers`, `api/Onboarding/Token`, `api/Onboarding/TokenAssociation`, `api/Operations/BusinessUnits`, `api/Operations/KnownConnectedSystem`, `api/Parties`, `api/Parties/Accounts`, `api/Parties/ConnectedSystemAssociations`
+- **Sample HTTP endpoints (41):**
 
   ```
   DELETE BusinessUnits/{businessUnitKey:guid}/AssociatedUsers
@@ -1694,6 +1695,7 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
   GET BusinessUnits
   GET BusinessUnits/{businessUnitKey:guid}
   GET BusinessUnits/{businessUnitKey:guid}/AssociatedUsers
+  GET BusinessUnits/{businessUnitKey:guid}/ItemCodes
   GET Party/{partyKey:guid}
   GET Payment/ActiveRequests
   GET Payment/RequestsDetails
@@ -1705,14 +1707,13 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
   GET {businessUnitKey:guid}/Accounts
   GET {businessUnitKey:guid}/PaymentAccounts
   GET {fundingRequestKey:Guid}
-  GET {fundsDisbursementKey:Guid}
   ```
 
 ## Core Platform API
 
 ### `Epp.Api`
 
-- **Files scanned:** 5087
+- **Files scanned:** 5199
 - **Projects (`*.csproj`):** `Epp.Api`, `Epp.Api.AccountChek`, `Epp.Api.AccountChek.Tests`, `Epp.Api.Accounting`, `Epp.Api.Accounting.Tests`, `Epp.Api.Accounts`, `Epp.Api.Accounts.Tests`, `Epp.Api.Aggregate.Data`, `Epp.Api.Aggregate.Data.Tests`, `Epp.Api.Analyzers`, `Epp.Api.Analyzers.Tests`, `Epp.Api.BankAccounts`, `Epp.Api.BankAccounts.Tests`, `Epp.Api.Branding`, `Epp.Api.Branding.Tests`, `Epp.Api.Documents`, `Epp.Api.Documents.Tests`, `Epp.Api.Escrow`, `Epp.Api.Escrow.Tests`, `Epp.Api.Integration.Elis`
 - **Root namespaces:** `Epp.Api.AccountChek.Api`, `Epp.Api.AccountChek.Api.Models`, `Epp.Api.AccountChek.Domain`, `Epp.Api.AccountChek.Messages`, `Epp.Api.Accounting.Party.Api`, `Epp.Api.Accounts.Api`, `Epp.Api.Accounts.Api.Models`, `Epp.Api.Accounts.Domain`
 - **Controllers (18):** `AccountChekController`, `AccountChekWebhookController`, `AccountController`, `AccountingVendorController`, `BankAccountController`, `BankController`, `EscrowOfficeController`, `EscrowUserController`, `InternalBankAccountController`, `InternalBankAccountExternalAssociationController`, `anonymouscontroller`, `anonymouswithauthorizemethodcontroller`, `limitedauthorization2controller`, `limitedauthorizationcontroller`, `limitedauthorizationwithcustomcontroller`, `limitedauthorizationwithlatecontroller`, `missingauthorizationcontroller`, `simplecontroller`
@@ -1739,8 +1740,8 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
 
 ### `Epp.Escrow.Admin`
 
-- **Files scanned:** 704
-- **Projects (`*.csproj`):** `Epp.Escrow.Admin`, `Epp.Escrow.Admin.Shared`
+- **Files scanned:** 732
+- **Projects (`*.csproj`):** `Epp.Escrow.Admin`, `Epp.Escrow.Admin.Shared`, `Epp.Escrow.Admin.Shared.Tests`
 - **Root namespaces:** `Epp.Escrow.Admin.AiSearch.Api`, `Epp.Escrow.Admin.AiSearch.Application.Models`, `Epp.Escrow.Admin.Api`, `Epp.Escrow.Admin.Api.Names`, `Epp.Escrow.Admin.Services`
 - **Controllers (26):** `AiSearchIndexController`, `BankAccountController`, `BankController`, `CustomerOnboardingTokenController`, `EscrowIncomingPaymentsController`, `EscrowOfficeController`, `EscrowOperationsPaymentController`, `EscrowPaymentAggregateController`, `EscrowPaymentAggregatePartySettingsController`, `EscrowPaymentAggregateProjectionController`, `EscrowPaymentProjectionController`, `EscrowPaymentsController`, `ExpectedPaymentsProjectionController`, `InternalBankAccountController`, `InternalBankAccountExternalAssociationController`, `ModernTreasuryInternalAccountController`, `NamesController`, `PartyConnectedSystemAssociationController`, `PartyProjectionController`, `PaymentIntegrationController`, `PaymentRequestController`, `PreferencesController`, `SettingsController`, `TaskController`, `TransacteeController`
 - **Base routes:** `api/BankAccounts`, `api/Banks`, `api/Escrow/Onboarding/Token`, `api/Escrow/PaymentRequest`, `api/Escrow/Payments`, `api/Escrow/Payments/Aggregate`, `api/Escrow/Payments/Aggregate/PartySettings`, `api/Escrow/Payments/Expected/Incoming`, `api/EscrowOffices`, `api/Index`, `api/InternalBankAccounts`, `api/InternalBankAccounts/ModernTreasury`, `api/Parties/ConnectedSystem`, `api/Projections/EscrowPaymentAggregates`, `api/Projections/EscrowPayments`
@@ -1750,8 +1751,8 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
 
 ### `Epp.Escrow.Customer`
 
-- **Files scanned:** 725
-- **Projects (`*.csproj`):** `Epp.Escrow.Customer.Api`, `Epp.Escrow.Customer.Onboarding`, `Epp.Escrow.Customer.Payment`, `Epp.Escrow.Customer.Profile`, `Epp.Escrow.Customer.Public`, `Epp.Escrow.Customer.Shared`
+- **Files scanned:** 732
+- **Projects (`*.csproj`):** `Epp.Escrow.Customer.Api`, `Epp.Escrow.Customer.Onboarding`, `Epp.Escrow.Customer.Payment`, `Epp.Escrow.Customer.Profile`, `Epp.Escrow.Customer.Public`, `Epp.Escrow.Customer.Shared`, `Epp.Escrow.Customer.Shared.Tests`
 - **Root namespaces:** `Epp.Escrow.Customer.Onboarding.Api`, `Epp.Escrow.Customer.Payment.Api`, `Epp.Escrow.Customer.Profile.Api`, `Epp.Escrow.Customer.Public.Api`
 - **Controllers (24):** `BankController`, `CustomerOnboardingTokenController`, `CustomerOnboardingTokenController`, `EscrowOfficeController`, `EscrowPaymentProjectionController`, `InternalBankAccountController`, `OnboardingSettingsController`, `PartyBankAccountController`, `PartyConnectedSystemAssociationController`, `PartyProjectionController`, `PaymentProfileController`, `PaymentRequestController`, `PaymentRequestController`, `PaymentSettingsController`, `PaymentsController`, `ProfileBankController`, `ProfileSettingsController`, `ProfileTransactionRouterController`, `PublicSettingsController`, `TestIdentityController`, `TokenExController`, `TransactionRouterController`, `VerificationAddressController`, `VerificationTwilioController`
 - **Base routes:** `Onboarding/Api/Address`, `Onboarding/Api/Banks`, `Onboarding/Api/Escrow/Onboarding/Token`, `Onboarding/Api/Escrow/PaymentRequest`, `Onboarding/Api/Parties/ConnectedSystem`, `Onboarding/Api/Settings`, `Onboarding/Api/TokenEx`, `Onboarding/Api/TransactionRouter`, `Onboarding/Api/Verification/Twilio`, `Payment/Api/Escrow/Payments`, `Payment/Api/InternalBankAccount`, `Payment/Api/Parties/PaymentProfile`, `Payment/Api/Settings`, `Profile/Api/Parties/BankAccounts`, `Profile/Api/Projection/Party`
@@ -1760,12 +1761,12 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
 
 ### `Epp.Api.Escrow.Operations`
 
-- **Files scanned:** 254
+- **Files scanned:** 272
 - **Projects (`*.csproj`):** `Epp.Api.Escrow.Operations`, `Epp.Api.Escrow.Operations.Integration`, `Epp.Api.Escrow.Operations.ServiceClient`, `Epp.Api.Escrow.Operations.Shared`, `Epp.Api.Escrow.Operations.Tests`
 - **Root namespaces:** `Epp.Api.Escrow.Operations.Accounts.Api`, `Epp.Api.Escrow.Operations.Accounts.Api.Models`, `Epp.Api.Escrow.Operations.Accounts.Application.Models`, `Epp.Api.Escrow.Operations.Integration.Services.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Api`, `Epp.Api.Escrow.Operations.PaymentRequest.Api.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Application.Models`, `Epp.Api.Escrow.Operations.PaymentRequest.Data`
 - **Controllers (4):** `AccountsController`, `ApproversController`, `ManagerQueueController`, `PaymentsController`
 - **Base routes:** `api/accounts`, `api/approvers`, `api/payments`, `api/payments/manager-queue`
-- **DTO / Model / Command / Query types (12):** `CreateConsolidatedPaymentServiceModel`, `CreateFilePaymentServiceModel`, `CreatePaymentRequestServiceModel`, `EligibleApproverServiceModel`, `GetEligibleApproversServiceModel`, `InboundPaymentDto`, `OutboundPaymentDto`, `PaymentApprovalDto`, `PaymentRequestEntity`, `PaymentStatusServiceModel`, `UserApprovalLevels`, `UserEntity`
+- **DTO / Model / Command / Query types (11):** `CreateConsolidatedPaymentServiceModel`, `CreateFilePaymentServiceModel`, `EligibleApproverServiceModel`, `GetEligibleApproversServiceModel`, `InboundPaymentDto`, `OutboundPaymentDto`, `PaymentApprovalDto`, `PaymentRequestEntity`, `PaymentStatusServiceModel`, `UserApprovalLevels`, `UserEntity`
 - **Domain enums:** `PaymentApprovalStatus`, `PaymentApprovalType`, `PaymentRequestStatus`, `PaymentType`
 
 ## Parties Onboarding
@@ -1811,8 +1812,8 @@ This section is a **fact-based snapshot** of the code base (controllers, routes,
 
 ### `Epp.Parties.Profile`
 
-- **Files scanned:** 384
-- **Projects (`*.csproj`):** `Epp.Parties.Profile`, `Epp.Parties.Profile.Shared`
+- **Files scanned:** 391
+- **Projects (`*.csproj`):** `Epp.Parties.Profile`, `Epp.Parties.Profile.Shared`, `Epp.Parties.Profile.Shared.Tests`
 - **Root namespaces:** `Epp.Parties.Profile.Api`
 - **Controllers (17):** `AccountController`, `AccountingController`, `BankController`, `IntegrationElisController`, `OnboardingTokenController`, `PartyAccountController`, `PartyController`, `PartyLocationController`, `PartyUserAccessTokenController`, `PartyUserController`, `PartyUserPartyAssociationController`, `PaymentFlowEnabledAccountController`, `SettingsController`, `StripeAccountController`, `StripeController`, `VerificationController`, `VerificationTokenController`
 - **Base routes:** `api/Accounting`, `api/Accounts`, `api/Accounts/Stripe`, `api/Banks`, `api/Integration/Elis`, `api/Onboarding`, `api/Parties`, `api/Parties/Accounts`, `api/Parties/PartyUser/Token`, `api/Parties/UserAssociations`, `api/Parties/Users`, `api/PaymentFlowEnabledAccounts`, `api/Settings`, `api/Stripe`, `api/Verification`

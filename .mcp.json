@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "epp-testcase-generator": {
+      "type": "stdio",
+      "command": ".venv/Scripts/python.exe",
+      "args": ["test/mcp_server.py"]
+    }
+  }
+}

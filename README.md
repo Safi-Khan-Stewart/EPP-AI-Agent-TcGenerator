@@ -56,6 +56,106 @@ python test/ado_advisor.py 432288
 - Test Case work items created in ADO (linked to the user story)
 - `test_cases_US417882.html` — local HTML report
 
+### Step-by-step mode (no browser)
+
+The same pipeline can be split into separate steps. Claude uses these, and they
+are handy for scripting too. Generated test cases are saved to
+`reports/test_cases_US<ID>.json`, which can be edited before pushing.
+
+```powershell
+# 1. Generate only (reads from ADO, writes the JSON, no server)
+python test/ado_advisor.py --json 432288
+
+# 2. (optional) after editing the JSON: validate it, re-number, list the test cases
+python test/ado_advisor.py --check reports/test_cases_US432288.json
+
+# 3a. Push chosen test cases (numbers from the list) to ADO and link them to the story
+python test/ado_advisor.py --push reports/test_cases_US432288.json --select 1,3-5
+
+# 3b. ...or review them in the browser page instead
+python test/ado_advisor.py --review reports/test_cases_US432288.json
+```
+
+Pushed test cases are recorded in the JSON, so re-running a push never creates
+duplicates. Generation also lists the test cases already linked to the story in ADO.
+
+---
+
+## Using with Claude
+
+The project ships with Claude support (replacing the previous GitHub Copilot setup):
+
+| File | What it does |
+| ---- | ------------ |
+| `CLAUDE.md` | Project instructions Claude loads automatically |
+| `.claude/skills/` | Slash commands: `/generate-test-cases`, `/sprint-status`, `/add-lesson` |
+| `.claude/settings.json` | Lets safe commands run without prompts; always asks before pushing to ADO |
+| `.mcp.json` + `test/mcp_server.py` | MCP server exposing the generator as tools (Claude Code and Claude Desktop) |
+
+### Claude Code (terminal or VS Code chat panel)
+
+Set the `ADO_*` environment variables (see [Configuration](#configuration)) and
+install the dependencies into `.venv`, then open the project folder:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+claude          # or open the Claude Code panel in VS Code
+```
+
+Then ask in plain language or use a slash command:
+
+```
+/generate-test-cases 432288
+```
+
+Claude generates the test cases, reviews them against `Rules.md` (scope, titles,
+steps, coverage of every acceptance criterion), fixes real problems, shows you a
+numbered table and asks which numbers to push. Nothing is created in ADO until
+you name the test cases, and Claude Code asks for confirmation before the push
+runs. Say "open the review page" if you prefer the browser checkboxes.
+
+- `/sprint-status` (or `/sprint-status full` for the advisor report)
+- `/add-lesson <feedback> [story id]` turns reviewer feedback into a
+  `LessonsLearned.md` entry and the matching generator code fix.
+
+**First run:** start `claude` in this folder once from a terminal and accept
+both prompts: **trust this folder** (until then Claude Code ignores the
+project's `.claude/settings.json` permissions) and **approve the
+`epp-testcase-generator` MCP server** from `.mcp.json`. With the server
+approved, generating and refining test cases runs without permission prompts
+and only the push asks for confirmation. Without it, the skills fall back to the
+command line. Claude Code's PowerShell tool then asks before every generator
+command, because its permission rules can't pre-approve commands that contain
+file paths.
+
+### Claude Desktop
+
+Add the server to `%APPDATA%\Claude\claude_desktop_config.json`, using the
+absolute path of your clone, then restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "epp-testcase-generator": {
+      "command": "D:\\EPP AI Generator\\EPP-AI-Agent-TcGenerator\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\EPP AI Generator\\EPP-AI-Agent-TcGenerator\\test\\mcp_server.py"]
+    }
+  }
+}
+```
+
+In a chat, pick the **"Generate EPP test cases for a User Story"** prompt from
+the + menu, or just ask, e.g. *"Generate test cases for user story 432288"*.
+Tools: `get_user_story`, `generate_test_cases`, `get_test_cases`,
+`update_test_cases`, `push_test_cases`, `open_review_page`,
+`get_generation_rules`, `sprint_status`.
+
+The server reads the `ADO_*` variables from your user environment; if Claude
+Desktop doesn't see them, put them in a `.env` file in the project root (same
+format as `.env.example`). To keep tool calls fast, the server skips the
+14-day refresh of the domain documentation; the command line still runs it.
+
 ---
 
 ## Full Advisor Report
@@ -101,13 +201,23 @@ generate_test_cases_report_html(417882)
 d:\ADO with PAT\
 ├── test\
 │   ├── ado_advisor.py       # Full advisor: analysis, reports, test case generation
-│   └── sprint_status.py     # Standalone sprint status report generator
+│   ├── domain_context.py    # EPP portal/screen/role catalogue + area tag
+│   ├── history_context.py   # Prior stories in the same Area Path
+│   ├── sprint_status.py     # Standalone sprint status report generator
+│   └── mcp_server.py        # MCP server for Claude Desktop / Claude Code
 ├── reports\                  # All generated reports go here
 │   ├── sprint_status.html
 │   ├── sprint_report.html
 │   ├── test_cases_US*.html
+│   ├── test_cases_US*.json   # Review sessions (generate → edit → push)
 │   └── review_test_cases_US*.html
+├── .claude\
+│   ├── settings.json         # Shared Claude Code permissions
+│   └── skills\               # /generate-test-cases, /sprint-status, /add-lesson
+├── CLAUDE.md                 # Instructions Claude loads for this project
+├── .mcp.json                 # Registers the MCP server with Claude Code
 ├── Rules.md                  # Test case generation rules (single source of truth)
+├── LessonsLearned.md         # Reviewer feedback enforced by the generator
 ├── Testcase_Generator.md     # Workflow & instructions
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
